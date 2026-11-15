@@ -5,6 +5,8 @@ set -euo pipefail
 # Upstream ships iOS as one static archive with every plugin. This links the plugins LIVI uses
 # and the API gstreamer-rs binds out of it into one GStreamer.framework the app embeds, the
 # iOS counterpart of libgstreamer_android.so. gst_init_static_plugins registers the plugins.
+# PATCHED_APPLEMEDIA and PATCHED_GL_WINDOW (from build-patched-ios.sh) replace the archive's
+# applemedia plugin (vtdec low latency, full-range HEVC) and EAGL GL window (layer refcount).
 
 XCF="$(cd "${1:?GStreamer.xcframework required}" && pwd)"
 OUT="${2:-assets/gstreamer/ios-arm64}"
@@ -76,6 +78,9 @@ frameworks=(
 )
 
 [[ -f "$SLICE/libGStreamer.a" ]] || { echo "$SLICE/libGStreamer.a missing" >&2; exit 1; }
+for patched in PATCHED_APPLEMEDIA PATCHED_GL_WINDOW; do
+  [[ -f "${!patched:-}" ]] || { echo "$patched not set, run build-patched-ios.sh first" >&2; exit 1; }
+done
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -84,6 +89,15 @@ members="$(ar -t "$SLICE/libGStreamer.a")"
 for p in "${plugins[@]}"; do
   grep -q "^libgst${p}_a-" <<<"$members" || { echo "archive lacks plugin $p" >&2; exit 1; }
 done
+
+archive="$work/libGStreamer.a"
+cp "$SLICE/libGStreamer.a" "$archive"
+grep "^libgstapplemedia_a-" <<<"$members" | xargs ar -d "$archive"
+gl_window="$(grep "^libgstgl-1_0_a-.*gstglwindow_eagl" <<<"$members")" || {
+  echo "archive lacks the EAGL GL window" >&2
+  exit 1
+}
+xargs ar -d "$archive" <<<"$gl_window"
 
 mkdir -p "$work/api"
 (cd "$work/api" && grep -E "$api" <<<"$members" | xargs ar -x "$SLICE/libGStreamer.a")
@@ -111,7 +125,7 @@ for f in "${frameworks[@]}"; do link+=(-framework "$f"); done
 "${CC[@]}" -dynamiclib -o "$fw/GStreamer" \
   -install_name @rpath/GStreamer.framework/GStreamer \
   -Wl,-dead_strip \
-  "$work/init.o" "$work"/api/*.o "$SLICE/libGStreamer.a" \
+  "$work/init.o" "$work"/api/*.o "$PATCHED_GL_WINDOW" "$PATCHED_APPLEMEDIA" "$archive" \
   "${link[@]}" -lc++ -liconv -lresolv -lz
 
 version() {
