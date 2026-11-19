@@ -191,7 +191,8 @@ impl Services {
                     }
                 }),
                 restart: helper_restart.clone(),
-                use_sudo: cfg!(target_os = "linux"),
+                // SAFETY: geteuid has no preconditions.
+                use_sudo: cfg!(target_os = "linux") && unsafe { libc::geteuid() } != 0,
                 user_data: user_data.to_path_buf(),
                 restart_delay: HELPER_RESTART_DELAY,
                 max_restarts: Some(HELPER_MAX_RESTARTS),
@@ -402,6 +403,7 @@ impl CarPlay {
                 };
                 println!("[core] output codecs {codecs}");
                 probing.set_codecs(android_auto::codecs(&codecs));
+                probing.set_url_video(codecs.url);
                 let _ = tokio::task::spawn_blocking(move || probing.refresh()).await;
             });
         }
