@@ -4,7 +4,10 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -113,6 +116,7 @@ pub(crate) fn flash_bundle(
     led_flash_running();
 
     let mut wrote_any = false;
+    let mut fed: Option<Fed> = None;
     let mut report: Vec<String> = Vec::new();
     for (&(_, slice), (slot, staged)) in images.iter().zip(&staged) {
         let node = slot.node.as_str();
@@ -128,6 +132,7 @@ pub(crate) fn flash_bundle(
             continue;
         }
 
+        fed.get_or_insert_with(Fed::start);
         if let Some(before) = slot.before_write
             && let Err(e) = before()
         {
@@ -170,7 +175,7 @@ pub(crate) fn flash_bundle(
     write_progress("bundle", data.len(), data.len(), "done");
     if wrote_any {
         led_flash_done();
-        reboot_after(Duration::from_millis(500));
+        reboot_after(Duration::from_millis(500), fed.and_then(Fed::into_reboot));
         (
             S_200,
             T_JSON,
@@ -306,21 +311,83 @@ pub(crate) fn verify_flash(path: &str, expected: &[u8]) -> std::io::Result<()> {
 }
 
 pub(crate) fn reboot_soon() -> (&'static str, &'static str, Vec<u8>) {
-    reboot_after(Duration::from_millis(500));
+    reboot_after(Duration::from_millis(500), None);
     (S_200, T_JSON, ok_json("rebooting"))
 }
 
-pub(crate) fn reboot_after(delay: Duration) {
+fn arm_watchdog() -> Option<fs::File> {
+    const WDIOC_SETTIMEOUT: u32 = 0xc004_5706;
+    const TIMEOUT_S: libc::c_int = 10;
+    let dog = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/watchdog")
+        .ok()?;
+    let mut secs = TIMEOUT_S;
+    // SAFETY: the ioctl reads and writes one int, secs outlives the call.
+    unsafe { libc::ioctl(dog.as_raw_fd(), WDIOC_SETTIMEOUT as _, &mut secs) };
+    Some(dog)
+}
+
+/// Fed from its own thread while a flash writes: the process runs from the rootfs it overwrites
+/// and can die on any page it reads back, the unfed watchdog then resets the board.
+struct Fed {
+    dog: Option<Arc<fs::File>>,
+    stop: Arc<AtomicBool>,
+    feeder: Option<thread::JoinHandle<()>>,
+}
+
+impl Fed {
+    fn start() -> Self {
+        let dog = arm_watchdog().map(Arc::new);
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder = dog.clone().map(|dog| {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = (&*dog).write_all(b"k");
+                    thread::sleep(Duration::from_secs(2));
+                }
+            })
+        });
+        Self { dog, stop, feeder }
+    }
+
+    fn unfed(&mut self) -> Option<fs::File> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(feeder) = self.feeder.take() {
+            let _ = feeder.join();
+        }
+        self.dog.take().and_then(|dog| Arc::try_unwrap(dog).ok())
+    }
+
+    fn into_reboot(mut self) -> Option<fs::File> {
+        self.unfed()
+    }
+}
+
+impl Drop for Fed {
+    fn drop(&mut self) {
+        // A flash that ends without a reboot leaves the board running: the magic close stops it.
+        if let Some(mut dog) = self.unfed() {
+            let _ = dog.write_all(b"V");
+        }
+    }
+}
+
+pub(crate) fn reboot_after(delay: Duration, dog: Option<fs::File>) {
     thread::spawn(move || {
+        let dog = dog.or_else(arm_watchdog);
         thread::sleep(delay);
         // SAFETY: sync has no preconditions.
         unsafe {
             libc::sync();
         }
-        let _ = Command::new("/sbin/reboot").arg("-f").status();
         // SAFETY: reboot takes a plain command value and touches no memory of ours.
         unsafe {
             libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
         }
+        let _ = Command::new("/sbin/reboot").arg("-f").status();
+        // Kept open: depending on the driver, closing stops the watchdog.
+        std::mem::forget(dog);
     });
 }

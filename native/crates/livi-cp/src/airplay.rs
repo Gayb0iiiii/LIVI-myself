@@ -168,6 +168,8 @@ pub trait AirplayMedia: Send + Sync {
     fn volume(&self, db: f64);
     fn volume_db(&self) -> f64;
     fn name(&self) -> String;
+    /// Width, height and frame rate of the screen the mirror shows on.
+    fn screen(&self) -> (u32, u32, u32);
 }
 
 pub struct AirplayCtx {
@@ -177,7 +179,7 @@ pub struct AirplayCtx {
     pub helper: HelperSock,
     pub device_id: String,
     pub source_version: String,
-    pub features: u64,
+    pub features: Arc<AtomicU64>,
     pub txt: Vec<String>,
     pub sample_rate: u32,
 }
@@ -416,7 +418,10 @@ impl Conn {
             if asked_txt {
                 return plist(&dict([(
                     "txtAirPlay",
-                    Value::Data(txt_bytes(&self.ctx.txt)),
+                    Value::Data(txt_bytes(&livi_core_proto::features::with_features(
+                        &self.ctx.txt,
+                        self.ctx.features.load(Ordering::Relaxed),
+                    ))),
                 )]));
             }
             return plist(&self.info());
@@ -529,16 +534,17 @@ impl Conn {
 
     fn info(&self) -> Value {
         let ctx = &self.ctx;
+        let (w, h, fps) = ctx.media.screen();
         let display = dict([
             ("uuid", Value::String(DISPLAY_UUID.into())),
             ("widthPhysical", Value::Int(0)),
             ("heightPhysical", Value::Int(0)),
-            ("widthPixels", Value::Int(1920)),
-            ("heightPixels", Value::Int(1080)),
-            ("width", Value::Int(1920)),
-            ("height", Value::Int(1080)),
-            ("maxFPS", Value::Int(60)),
-            ("refreshRate", Value::Real(1.0 / 60.0)),
+            ("widthPixels", Value::Int(w.into())),
+            ("heightPixels", Value::Int(h.into())),
+            ("width", Value::Int(w.into())),
+            ("height", Value::Int(h.into())),
+            ("maxFPS", Value::Int(fps.into())),
+            ("refreshRate", Value::Real(1.0 / f64::from(fps.max(1)))),
             ("overscanned", Value::Bool(false)),
             ("features", Value::Int(14)),
             ("rotation", Value::Bool(false)),
@@ -546,7 +552,7 @@ impl Conn {
         dict([
             ("deviceID", Value::String(ctx.device_id.clone())),
             ("macAddress", Value::String(ctx.device_id.clone())),
-            ("features", Value::Int(ctx.features)),
+            ("features", Value::Int(ctx.features.load(Ordering::Relaxed))),
             ("statusFlags", Value::Int(68)),
             ("model", Value::String("LIVI".into())),
             ("manufacturer", Value::String("LIVI".into())),
