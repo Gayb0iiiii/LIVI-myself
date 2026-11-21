@@ -6,29 +6,26 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_base as gst_base;
-use livi_host_proto::VideoCodec;
+use livi_output_proto::VideoCodec;
 use std::sync::{Arc, Once};
 
-#[cfg(target_os = "android")]
-mod android_view;
 mod camera;
+#[cfg(in_process)]
+mod in_process_view;
 mod url_player;
 #[cfg_attr(
     all(target_os = "macos", feature = "window-view"),
     path = "view/mac.rs"
 )]
-#[cfg_attr(target_os = "android", path = "view/android.rs")]
+#[cfg_attr(in_process, path = "view/in_process.rs")]
 #[cfg_attr(
-    not(any(
-        all(target_os = "macos", feature = "window-view"),
-        target_os = "android"
-    )),
+    not(any(all(target_os = "macos", feature = "window-view"), in_process)),
     path = "view/none.rs"
 )]
 mod view;
-#[cfg(target_os = "android")]
-pub use android_view::{Views, set_surface, set_views};
 pub use camera::{CameraPlayer, direction, watch_cameras};
+#[cfg(in_process)]
+pub use in_process_view::{Views, set_surface, set_views};
 pub use url_player::UrlPlayer;
 use view::WindowView;
 
@@ -85,7 +82,7 @@ pub fn log_bus_messages(pipeline: &gst::Pipeline) {
             }
             _ => {}
         }
-        gst::BusSyncReply::Pass
+        gst::BusSyncReply::Drop
     });
 }
 
@@ -288,7 +285,7 @@ impl Player {
 
         force_sinks_realtime(&player.pipeline);
         if let Some(dec) = player.pipeline.by_name("dec") {
-            if cfg!(target_os = "macos") && decoder == "avdec_h265" {
+            if cfg!(target_vendor = "apple") && decoder == "avdec_h265" {
                 dec.set_property_from_str("thread-type", "frame");
                 dec.set_property("max-threads", 1i32);
                 eprintln!(
@@ -327,7 +324,7 @@ impl Player {
                 } else {
                     ""
                 },
-                std::env::var("LIVI_GST_SINK").ok().as_deref(),
+                livi_video::codec::sink_override().as_deref(),
             )
         };
 
@@ -521,6 +518,11 @@ fn usable(name: &str) -> bool {
     };
     dec.find_property("device-path").is_none()
         || dec.property::<Option<String>>("device-path").as_deref() == Some(node.as_str())
+}
+
+pub fn plays_urls() -> bool {
+    ensure_init();
+    gst::ElementFactory::find("playbin3").is_some()
 }
 
 pub fn probe(codec: VideoCodec) -> (bool, bool) {

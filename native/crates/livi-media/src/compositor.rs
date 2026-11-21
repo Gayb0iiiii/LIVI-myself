@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use livi_base::hex::rgb;
+use livi_base::num::round_half_up;
 use livi_core_proto::config::{Config, TouchCalibration};
 use livi_core_proto::input::{Input, Phase, Point};
 use livi_core_proto::state::{Display, Screen};
-use livi_host_proto::ctrl::{Command, Region, TouchCal};
+use livi_output_proto::ctrl::{Command, Region, TouchCal};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -42,15 +44,29 @@ pub fn env(cfg: &Config, ctrl: &Path) -> Vec<(String, String)> {
         ));
     }
     let screens = [
-        ("MAIN", &cfg.display_mode.main, &cfg.display_connector.main),
+        (
+            "MAIN",
+            &cfg.display_mode.main,
+            &cfg.display_connector.main,
+            cfg.display_rotation.main,
+        ),
         (
             "CLUSTER",
             &cfg.display_mode.cluster,
             &cfg.display_connector.cluster,
+            cfg.display_rotation.cluster,
         ),
-        ("AUX", &cfg.display_mode.aux, &cfg.display_connector.aux),
+        (
+            "AUX",
+            &cfg.display_mode.aux,
+            &cfg.display_connector.aux,
+            cfg.display_rotation.aux,
+        ),
     ];
-    for (role, mode, connector) in screens {
+    for (role, mode, connector, rotation) in screens {
+        if rotation != 0 {
+            env.push((format!("LIVI_{role}_ROTATION"), rotation.to_string()));
+        }
         if !mode.is_empty() {
             let key = if role == "MAIN" {
                 "LIVI_DISPLAY_MODE".to_string()
@@ -217,10 +233,6 @@ enum Cmd {
     State(String, String),
 }
 
-fn round_half_up(v: f64) -> f64 {
-    (v + 0.5).floor()
-}
-
 #[derive(Clone)]
 pub struct CompositorControl {
     tx: mpsc::UnboundedSender<Cmd>,
@@ -354,11 +366,20 @@ impl CompositorControl {
         ));
     }
 
+    pub fn rotation(&self, role: &str, degrees: u16) {
+        let _ = self.tx.send(Cmd::State(
+            format!("rotation:{role}"),
+            ctrl_line(Command::Rotation {
+                role: role.to_string(),
+                degrees,
+            }),
+        ));
+    }
+
     pub fn backdrop(&self, hex: &str) {
-        let (r, g, b) = rgb(hex);
         let _ = self.tx.send(Cmd::State(
             "__backdrop__".into(),
-            ctrl_line(Command::Backdrop([r, g, b])),
+            ctrl_line(Command::Backdrop(rgb(hex).unwrap_or_default())),
         ));
     }
 
@@ -386,15 +407,6 @@ fn fullscreen_line(role: &str, on: bool) -> String {
         role: role.to_string(),
         on,
     })
-}
-
-fn rgb(hex: &str) -> (u8, u8, u8) {
-    let h = hex.trim().trim_start_matches('#');
-    if h.len() != 6 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
-        return (0, 0, 0);
-    }
-    let n = u32::from_str_radix(h, 16).unwrap_or(0);
-    ((n >> 16) as u8, (n >> 8) as u8, n as u8)
 }
 
 pub fn backdrop_hex(cfg: &Config) -> String {
@@ -991,8 +1003,6 @@ mod tests {
         assert_eq!(backdrop_hex(&cfg), "#f5f5f5");
         cfg.background_color_light = Some("#ffffff".into());
         assert_eq!(backdrop_hex(&cfg), "#ffffff");
-        assert_eq!(rgb("#ff8000"), (255, 128, 0));
-        assert_eq!(rgb("nope"), (0, 0, 0));
     }
 
     #[test]

@@ -29,7 +29,6 @@ pub struct Config {
     pub country: String,
 
     pub car_play_source_version: String,
-    pub car_play_mfi_i2c_bus: u32,
     pub car_play_mfi_power_gpio: i32,
     pub car_play_mfi_files: String,
     pub car_play_vehicle_climate: bool,
@@ -141,6 +140,7 @@ pub struct Config {
 
     pub display_mode: PerScreen<String>,
     pub display_connector: PerScreen<String>,
+    pub display_rotation: PerScreen<u16>,
 
     pub screen_width_mm: PerScreen<u32>,
     pub screen_height_mm: PerScreen<u32>,
@@ -550,7 +550,6 @@ pub fn defaults() -> Config {
         wifi_channel_width: 40,
         country: "DE".into(),
         car_play_source_version: "950.7.1".into(),
-        car_play_mfi_i2c_bus: 2,
         car_play_mfi_power_gpio: -1,
         car_play_mfi_files: String::new(),
         car_play_vehicle_climate: false,
@@ -642,6 +641,7 @@ pub fn defaults() -> Config {
         cluster_map_night_mode: true,
         display_mode: PerScreen::default(),
         display_connector: PerScreen::default(),
+        display_rotation: PerScreen::default(),
         screen_width_mm: PerScreen::default(),
         screen_height_mm: PerScreen::default(),
         view_area: PerScreen::default(),

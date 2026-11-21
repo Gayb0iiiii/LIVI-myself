@@ -53,17 +53,20 @@ impl PowerLine {
             .write(true)
             .open(GPIO_CHIP)
             .map_err(|e| MfiError::Io(format!("open {GPIO_CHIP}: {e}")))?;
+        // SAFETY: an all-zero LineRequest is valid, it is plain integers.
         let mut req: LineRequest = unsafe { std::mem::zeroed() };
         req.offsets[0] = gpio;
         req.num_lines = 1;
         req.flags = GPIO_V2_LINE_FLAG_OUTPUT;
         req.consumer[..8].copy_from_slice(b"livi-mfi");
+        // SAFETY: chip is open for the call and req is the LineRequest this ioctl expects.
         if unsafe { libc::ioctl(chip.as_raw_fd(), GPIO_V2_GET_LINE_IOCTL as _, &mut req) } < 0 {
             return Err(MfiError::Io(format!(
                 "claim gpio {gpio}: {}",
                 std::io::Error::last_os_error()
             )));
         }
+        // SAFETY: on success the kernel returned a new line fd in req.fd that nothing else owns.
         let line = Self(unsafe { <fs::File as std::os::fd::FromRawFd>::from_raw_fd(req.fd) });
         sleep(POWER_OFF_SETTLE);
         line.set(true)
@@ -77,6 +80,7 @@ impl PowerLine {
             bits: u64::from(on),
             mask: 1,
         };
+        // SAFETY: the line fd is open for the call and values is the LineValues this ioctl expects.
         if unsafe {
             libc::ioctl(
                 self.0.as_raw_fd(),
@@ -99,27 +103,26 @@ impl Drop for PowerLine {
 
 pub struct I2cCoprocessor {
     file: fs::File,
+    bus: u32,
     addr: u16,
     protocol_major: Option<u8>,
     _power: Option<PowerLine>,
 }
 
 impl I2cCoprocessor {
-    pub fn open(bus: u32, power_gpio: i32) -> Result<Self, MfiError> {
+    /// Probing only reads, so other chips on the buses see no writes.
+    pub fn open(power_gpio: i32) -> Result<Self, MfiError> {
         let power = match u32::try_from(power_gpio) {
             Ok(gpio) => Some(PowerLine::on(gpio)?),
             Err(_) => None,
         };
-        let bus_path = format!("/dev/i2c-{bus}");
-        let addr = Self::probe(&bus_path)?;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&bus_path)
-            .map_err(|e| MfiError::Io(format!("open {bus_path}: {e}")))?;
+        let (bus, file, addr) = Self::scan().ok_or(MfiError::NoChip {
+            probed: DEV_ADDR_CANDIDATES.to_vec(),
+        })?;
         set_slave(&file, addr)?;
         let mut chip = Self {
             file,
+            bus,
             addr,
             protocol_major: None,
             _power: power,
@@ -132,29 +135,47 @@ impl I2cCoprocessor {
         self.addr
     }
 
-    fn probe(bus_path: &str) -> Result<u16, MfiError> {
+    pub fn bus(&self) -> u32 {
+        self.bus
+    }
+
+    fn scan() -> Option<(u32, fs::File, u16)> {
+        let mut buses: Vec<u32> = fs::read_dir("/dev")
+            .ok()?
+            .filter_map(|e| {
+                e.ok()?
+                    .file_name()
+                    .to_str()?
+                    .strip_prefix("i2c-")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        buses.sort_unstable();
+        buses.into_iter().find_map(|bus| {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("/dev/i2c-{bus}"))
+                .ok()?;
+            let addr = Self::probe(&file)?;
+            Some((bus, file, addr))
+        })
+    }
+
+    /// A sleeping chip NACKs the first access and wakes from it, so each bus gets a few rounds.
+    fn probe(mut file: &fs::File) -> Option<u16> {
         let deadline = Instant::now() + PROBE_TIMEOUT;
         while Instant::now() < deadline {
             for cand in DEV_ADDR_CANDIDATES {
-                let Ok(mut f) = fs::OpenOptions::new().read(true).write(true).open(bus_path) else {
-                    continue;
-                };
-                if set_slave(&f, cand).is_err() {
-                    continue;
-                }
-                if f.write_all(&[REG_DEVICE_VERSION]).is_err() {
-                    continue;
-                }
                 let mut buf = [0u8; 1];
-                if f.read_exact(&mut buf).is_ok() {
-                    return Ok(cand);
+                if set_slave(file, cand).is_ok() && file.read_exact(&mut buf).is_ok() {
+                    return Some(cand);
                 }
             }
             sleep(BUSY_RETRY);
         }
-        Err(MfiError::NoChip {
-            probed: DEV_ADDR_CANDIDATES.to_vec(),
-        })
+        None
     }
 
     fn retry(
@@ -201,6 +222,7 @@ impl I2cCoprocessor {
 }
 
 fn set_slave(file: &fs::File, addr: u16) -> Result<(), MfiError> {
+    // SAFETY: file is open for the call and I2C_SLAVE takes the address by value.
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), I2C_SLAVE as _, addr as libc::c_ulong) };
     if rc < 0 {
         Err(MfiError::Io(format!(

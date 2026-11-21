@@ -6,15 +6,15 @@ use serde_json::Value as Json;
 
 use crate::bplist::{self, Value, dict};
 use crate::control_cipher::ControlCipher;
-use crate::crypto::{
-    aes_ctr128, chacha_seal, ed25519_sign, hkdf_sha512, nonce_label, nonce64, sha1, sha256,
-};
 use crate::hid::{Contact, KnobState, knob_report, touch_device, touch_report};
 use crate::identity::hex;
 use crate::info::{DisplayConfig, Icon, InfoConfig, Insets, build};
 use crate::rtsp::{Response, build_response, parse};
 use crate::srp::SrpServer;
 use crate::tlv8;
+use livi_crypto::{
+    aes_ctr128, chacha_seal, ed25519_sign, hkdf_sha512, nonce_label, nonce64, sha1, sha256,
+};
 
 fn vectors() -> Json {
     serde_json::from_str(include_str!("ts_vectors.json")).expect("valid vector file")
@@ -47,6 +47,7 @@ fn info_config() -> InfoConfig {
         bt_mac: "11:22:33:44:55:66".into(),
         source_version: "950.7.1".into(),
         hevc: true,
+        video_playback: true,
         main: DisplayConfig {
             width_pixels: 1280,
             height_pixels: 720,

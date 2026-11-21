@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
-use livi_crypto::open;
+use livi_crypto::{ChaCha, TAG_LEN, nonce64};
 use livi_video::nal::{CpCodec, detect_codec};
 
 pub const HEADER_LEN: usize = 128;
 const OP_VIDEO_FRAME: u8 = 0;
 const OP_VIDEO_CONFIG: u8 = 1;
 const MAX_BODY: usize = 8 * 1024 * 1024;
-const TAG_LEN: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Implausible(pub usize);
@@ -20,7 +19,7 @@ pub trait ScreenSink {
 }
 
 pub struct ScreenStream {
-    key: [u8; 32],
+    key: ChaCha,
     counter: u64,
     acc: Vec<u8>,
     sink: Box<dyn ScreenSink>,
@@ -29,7 +28,7 @@ pub struct ScreenStream {
 impl ScreenStream {
     pub fn new(key: [u8; 32], sink: Box<dyn ScreenSink>) -> Self {
         Self {
-            key,
+            key: ChaCha::new(&key),
             counter: 0,
             acc: Vec::new(),
             sink,
@@ -43,27 +42,31 @@ impl ScreenStream {
 
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), Implausible> {
         self.acc.extend_from_slice(chunk);
-        loop {
-            if self.acc.len() < HEADER_LEN {
-                return Ok(());
+        let mut at = 0;
+        let result = loop {
+            let left = self.acc.len() - at;
+            if left < HEADER_LEN {
+                break Ok(());
             }
-            let body_size =
-                u32::from_le_bytes([self.acc[0], self.acc[1], self.acc[2], self.acc[3]]) as usize;
+            let m = &self.acc[at..];
+            let body_size = u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as usize;
             if body_size > MAX_BODY {
-                return Err(Implausible(body_size));
+                break Err(Implausible(body_size));
             }
-            if self.acc.len() < HEADER_LEN + body_size {
-                return Ok(());
+            if left < HEADER_LEN + body_size {
+                break Ok(());
             }
-            self.handle(body_size);
-            self.acc.drain(..HEADER_LEN + body_size);
-        }
+            self.handle(at, body_size);
+            at += HEADER_LEN + body_size;
+        };
+        self.acc.drain(..at);
+        result
     }
 
-    fn handle(&mut self, body_size: usize) {
-        let opcode = self.acc[4];
-        let (header, rest) = self.acc.split_at(HEADER_LEN);
-        let body = &rest[..body_size];
+    fn handle(&mut self, at: usize, body_size: usize) {
+        let opcode = self.acc[at + 4];
+        let (header, rest) = self.acc[at..].split_at_mut(HEADER_LEN);
+        let body = &mut rest[..body_size];
 
         if opcode == OP_VIDEO_CONFIG {
             let (codec, offset) = detect_codec(body);
@@ -74,33 +77,25 @@ impl ScreenStream {
             return;
         }
 
-        let opened;
         let frame: &[u8] = if body.len() >= TAG_LEN {
-            let Some(plain) = Self::open(&self.key, self.counter, header, body) else {
+            let Some(plain) = self.key.open_in_place(&nonce64(self.counter), body, header) else {
                 eprintln!("[cp_screen] frame auth failed at counter {}", self.counter);
                 return;
             };
             self.counter += 1;
-            opened = plain;
-            &opened
+            plain
         } else {
             body
         };
 
         self.sink.on_frame(frame);
     }
-
-    fn open(key: &[u8; 32], counter: u64, header: &[u8], body: &[u8]) -> Option<Vec<u8>> {
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        open(key, &nonce, body, header)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use livi_crypto::seal;
+    use livi_crypto::chacha_seal;
 
     const KEY: [u8; 32] = [7u8; 32];
 
@@ -149,9 +144,7 @@ mod tests {
         let mut header = vec![0u8; HEADER_LEN];
         header[..4].copy_from_slice(&((plain.len() + TAG_LEN) as u32).to_le_bytes());
         header[4] = OP_VIDEO_FRAME;
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        let body = seal(&KEY, &nonce, plain, &header).unwrap();
+        let body = chacha_seal(&KEY, &nonce64(counter), plain, &header);
 
         let mut msg = header;
         msg.extend_from_slice(&body);
@@ -280,6 +273,7 @@ pub mod receiver {
         listener: TcpListener,
         sources: Vec<glib::SourceId>,
         client: Rc<RefCell<Option<std::net::TcpStream>>>,
+        client_watch: Rc<RefCell<Option<glib::SourceId>>>,
         stream: Rc<RefCell<ScreenStream>>,
     }
 
@@ -302,6 +296,7 @@ pub mod receiver {
                 listener,
                 sources: Vec::new(),
                 client: Rc::new(RefCell::new(None)),
+                client_watch: Rc::new(RefCell::new(None)),
                 stream: Rc::new(RefCell::new(ScreenStream::new(key, sink))),
             };
             r.watch_listener();
@@ -312,6 +307,7 @@ pub mod receiver {
             let fd = self.listener.as_raw_fd();
             let listener = self.listener.try_clone().expect("dup listener");
             let client = self.client.clone();
+            let client_watch = self.client_watch.clone();
             let stream = self.stream.clone();
 
             let id = glib_unix::unix_fd_add_local(fd, IOCondition::IN, move |_, _| {
@@ -327,7 +323,8 @@ pub mod receiver {
 
                 let cfd = sock.as_raw_fd();
                 *client.borrow_mut() = Some(sock);
-                watch_client(cfd, client.clone(), stream.clone());
+                let id = watch_client(cfd, client.clone(), client_watch.clone(), stream.clone());
+                *client_watch.borrow_mut() = Some(id);
                 eprintln!("[cp_screen] video data connection accepted");
                 glib::ControlFlow::Continue
             });
@@ -338,11 +335,13 @@ pub mod receiver {
     fn watch_client(
         fd: RawFd,
         client: Rc<RefCell<Option<std::net::TcpStream>>>,
+        client_watch: Rc<RefCell<Option<glib::SourceId>>>,
         stream: Rc<RefCell<ScreenStream>>,
-    ) {
+    ) -> glib::SourceId {
         let cond = IOCondition::IN | IOCondition::HUP | IOCondition::ERR;
         glib_unix::unix_fd_add_local(fd, cond, move |_, cond| {
             let drop_client = |stream: &Rc<RefCell<ScreenStream>>| {
+                client_watch.borrow_mut().take();
                 *client.borrow_mut() = None;
                 stream.borrow_mut().reset();
                 glib::ControlFlow::Break
@@ -355,6 +354,7 @@ pub mod receiver {
             let read = {
                 let mut guard = client.borrow_mut();
                 let Some(sock) = guard.as_mut() else {
+                    client_watch.borrow_mut().take();
                     return glib::ControlFlow::Break;
                 };
                 sock.read(&mut chunk)
@@ -369,7 +369,7 @@ pub mod receiver {
                     }
                 },
             }
-        });
+        })
     }
 
     impl Drop for ScreenReceiver {
@@ -377,6 +377,10 @@ pub mod receiver {
             for id in self.sources.drain(..) {
                 id.remove();
             }
+            if let Some(id) = self.client_watch.borrow_mut().take() {
+                id.remove();
+            }
+            self.client.borrow_mut().take();
         }
     }
 }

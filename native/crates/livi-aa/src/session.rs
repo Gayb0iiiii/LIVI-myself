@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use livi_aa_proto::VersionResponseOptions;
-use livi_host_proto::feed as feedproto;
+use livi_output_proto::feed as feedproto;
 use prost::Message as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -274,6 +274,7 @@ where
             };
             framer.push(&buf[..n]);
             while let Some(item) = framer.next_item() {
+                let Ok(item) = item else { return };
                 if item_tx.send(item).await.is_err() {
                     return;
                 }
@@ -518,8 +519,13 @@ impl<W: AsyncWrite + Unpin + Send> Session<W> {
             ),
             None => String::new(),
         };
+        let suite = self
+            .tls
+            .as_ref()
+            .and_then(|t| t.cipher_suite())
+            .map_or_else(|| "-".to_string(), |s| format!("{s:?}"));
         println!(
-            "[aa-session] {}: tls up, protocol {major}.{minor}{ping}",
+            "[aa-session] {}: tls up ({suite}), protocol {major}.{minor}{ping}",
             self.peer.label
         );
         let mut ready =
@@ -693,6 +699,7 @@ async fn read_mic(mut sock: UnixStream, tx: mpsc::Sender<(u64, Vec<u8>)>) {
         };
         framer.push(&buf[..n]);
         while let Some(record) = framer.next_record() {
+            let Ok(record) = record else { return };
             if record.kind == feedproto::KIND_MIC {
                 let _ = tx.try_send((record.ts, record.payload));
             }

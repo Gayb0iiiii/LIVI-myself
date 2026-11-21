@@ -2,7 +2,7 @@
 # LIVI-Link i.MX6ULL dongle kernel for the module RADIO names (board.sh): zImage with the initramfs
 # built in and our DTB appended, which the provisioner stages for the vendor U-Boot (dongle arm
 # imx6ul kernel <image> --write), and the Bluetooth modules and livid for the rootfs.
-# Order: ../build-userspace.sh <this dir>, build.sh, ../../common/build-rootfs.sh <this dir>,
+# Order: ../../common/build-userspace.sh <this dir>, build.sh, ../../common/build-rootfs.sh <this dir>,
 # ../../common/pack-bundle.sh <this dir>.
 set -euo pipefail
 
@@ -17,7 +17,7 @@ done
 fetch_kernel
 fetch_firmware
 
-log "apply kernel patches (bus clocks on the ULL, USB gadget without BSV wait, no charger detection, MX25L128 without SFDP, mwifiex AP receive rate)"
+log "apply kernel patches (bus clocks on the ULL, USB gadget without BSV wait, no charger detection, MX25L128 quad from SFDP, mwifiex AP receive rate)"
 apply_patches "$HERE/kernel-patches" "$KDIR"
 
 log "install the board DTS with the $RADIO part"

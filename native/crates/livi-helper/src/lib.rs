@@ -9,7 +9,7 @@ pub mod bluez;
 pub mod bt_dongle;
 #[cfg(not(target_os = "linux"))]
 pub mod dongle;
-pub mod embedded;
+pub mod in_process;
 pub mod link;
 pub mod mfi;
 pub mod wired;
@@ -17,9 +17,9 @@ pub mod wired;
 pub mod wireless;
 
 use livi_core_proto::helper::HelperStart;
-use livi_runtime::bringup::CpConfig;
-use livi_runtime::ident::{Identity, Theme, Transport};
-use livi_runtime::vehicle::{Fuels, Plugs};
+use livi_helper_stack::bringup::CpConfig;
+use livi_helper_stack::ident::{Identity, Theme, Transport};
+use livi_helper_stack::vehicle::{Fuels, Plugs};
 use livi_wifi::{Band, Channel};
 
 pub const DEFAULT_NAME: &str = "LIVI";
@@ -79,6 +79,7 @@ pub fn carplay(start: &HelperStart, transport: Transport) -> (Identity, CpConfig
     (identity, cp)
 }
 
+#[cfg_attr(not(usb_host), allow(dead_code))]
 pub(crate) fn short(serial: &str) -> &str {
     &serial[..8.min(serial.len())]
 }

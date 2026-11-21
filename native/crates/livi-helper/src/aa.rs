@@ -7,14 +7,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(usb_host)]
 use livi_aa::usb::Control;
 use livi_aa::wpp;
 use livi_core_proto::aa_events::{AaHelperEvent, AaTransport};
 use livi_core_proto::helper::HelperSockets;
-use livi_runtime::aa_sock::{self, AaSockDeps};
-use livi_runtime::livi_sock::Broadcaster;
-use livi_runtime::sco::ScoSink;
-use livi_runtime::state::HelperState;
+use livi_helper_stack::aa_sock::{self, AaSockDeps};
+use livi_helper_stack::livi_sock::Broadcaster;
+use livi_helper_stack::sco::ScoSink;
+use livi_helper_stack::state::HelperState;
 use livi_wifi::{Channel, Security};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -77,9 +78,9 @@ fn ip_facing_dongle() -> Option<String> {
     let iface = livi_link_host::link::host_iface();
     #[cfg(not(target_os = "linux"))]
     let iface =
-        livi_link_host::link::name().and_then(|name| livi_runtime::net::iface_facing(&name));
+        livi_link_host::link::name().and_then(|name| livi_helper_stack::net::iface_facing(&name));
     iface
-        .and_then(|iface| livi_runtime::net::ipv4_of(&iface))
+        .and_then(|iface| livi_helper_stack::net::ipv4_of(&iface))
         .map(|a| a.to_string())
 }
 
@@ -89,7 +90,7 @@ pub async fn watch_dongle(
     cfg: AaConfig,
     bcast: Broadcaster,
     wired: WiredPhones,
-    state: Arc<livi_runtime::state::HelperState>,
+    state: Arc<livi_helper_stack::state::HelperState>,
 ) {
     while let Some(arrival) = arrivals.recv().await {
         let (cfg, bcast, wired, state) = (cfg.clone(), bcast.clone(), wired.clone(), state.clone());
@@ -109,9 +110,11 @@ pub async fn watch_dongle(
     }
 }
 
+#[cfg_attr(not(usb_host), allow(unused_variables))]
 pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcaster, WiredPhones) {
     let events = Broadcaster::default();
     let wired = WiredPhones::default();
+    #[cfg(usb_host)]
     let control = Control::default();
     let deps = AaSockDeps {
         set_wired_phones: Box::new({
@@ -120,10 +123,13 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
         }),
         events: events.clone(),
         set_sco_sink: Box::new(move |target| sco_sink.set(target)),
+        #[cfg(usb_host)]
         restart_usb: Box::new({
             let control = control.clone();
             move |serial| control.restart(serial)
         }),
+        #[cfg(not(usb_host))]
+        restart_usb: Box::new(|_| 0),
     };
     let path = sockets.android_auto.clone();
     tokio::spawn(async move {
@@ -131,6 +137,7 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
             eprintln!("[aa-sock] ended: {e}");
         }
     });
+    #[cfg(usb_host)]
     if usb {
         tokio::spawn(watch_usb(control, sockets.sessions.clone(), events.clone()));
         println!("[helper] Android Auto USB watcher started");
@@ -138,6 +145,7 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
     (events, wired)
 }
 
+#[cfg(usb_host)]
 async fn watch_usb(control: Control, sessions: PathBuf, events: Broadcaster) {
     let subscribed = events.clone();
     livi_aa::usb::run(
@@ -292,6 +300,12 @@ fn emit_device(bcast: &Broadcaster, mac: &str, id: &wpp::Identity) {
         usb_serial: id.serial.clone(),
     };
     bcast.push_json(event.to_line());
+}
+
+pub fn serve_wifi(port: u16, sessions: PathBuf, events: Broadcaster) {
+    tokio::spawn(livi_aa::server::run(port, sessions, move |socket, peer| {
+        announce_session(&events, socket, peer, AaTransport::Wifi, None);
+    }));
 }
 
 pub fn announce_session(

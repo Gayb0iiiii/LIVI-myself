@@ -28,38 +28,43 @@ use livi_cp::hid::{KnobState, media_button, telephony_button};
 use livi_cp::manager::{CallPhase, CpCmd, CpEvent, CpHandle, HelperPresence, Presence, SessionId};
 use livi_cp::stack::{AudioKind, StackCmd, Touch};
 use livi_cp::ui_sync::{self, Appearance, PhoneChoice};
-use livi_host_proto::{PLANE_AIRPLAY, PLANE_MAIN};
-use livi_media::gst_host::HostEvent;
+use livi_media::output::OutputEvent;
 use livi_media::planes::{ClusterPlanes, Crop, MainPlane};
+use livi_output_proto::{PLANE_AIRPLAY, PLANE_MAIN};
 use serde_json::{Map, Value};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
-use crate::aa_telemetry::{self, AaTelemetry};
-use crate::android_auto;
-use crate::cp_telemetry::{CpTelemetry, FROM_CARPLAY};
+use crate::audio::spectrum;
 use crate::devices::{self, Devices, Seen};
-use crate::hands_free::{self, Back, HandsFree, Io};
+use crate::files::status_file::Activity;
 use crate::helper;
 use crate::hub::Hub;
-use crate::nav_text;
-use crate::spectrum;
-use crate::status_file::Activity;
-use crate::telemetry::{CLIMATE, NOTIFICATION, SOURCE};
-use crate::theme_catalog::{self, ThemeId};
 use crate::update::UpdateAsk;
+use crate::vehicle::aa_telemetry::{self, AaTelemetry};
+use crate::vehicle::cp_telemetry::{CpTelemetry, FROM_CARPLAY};
+use crate::vehicle::telemetry::{CLIMATE, NOTIFICATION, SOURCE};
+use hands_free::{Back, HandsFree, Io};
+use theme_catalog::ThemeId;
 
 pub use ap::ApEvent;
 
 mod aa;
+pub mod airplay;
+pub mod android_auto;
 mod ap;
 mod audio;
+pub mod carplay;
 mod cluster;
 mod cp;
+pub mod cp_radio;
+pub mod hands_free;
 mod input;
+pub mod nav_text;
 mod players;
 mod screens;
 mod sessions;
 mod state;
+pub mod theme_catalog;
 
 const RAMP_DOWN_MS: u32 = 500;
 const RAMP_UP_MS: u32 = 1500;
@@ -361,6 +366,7 @@ pub struct Drivers {
     pub telemetry: mpsc::UnboundedSender<Value>,
     pub settings: mpsc::UnboundedSender<Value>,
     pub themes: PathBuf,
+    pub mfi_chip: PathBuf,
 }
 
 pub struct Projection {
@@ -400,13 +406,14 @@ pub struct Projection {
     apply_due: Option<tokio::time::Instant>,
     cluster: Cluster,
     themes: PathBuf,
+    mfi_chip: PathBuf,
     theme_asked: String,
     theme_ready: (mpsc::UnboundedSender<Theme>, mpsc::UnboundedReceiver<Theme>),
     radio: Option<mpsc::UnboundedSender<crate::radio::RadioAsk>>,
     players: players::Players,
     ap_events: Option<mpsc::UnboundedReceiver<ApEvent>>,
     ap_peers: HashMap<u64, ap::ApPeer>,
-    ap_audio: Option<Arc<crate::airplay::ApAudio>>,
+    ap_audio: Option<Arc<crate::projection::airplay::ApAudio>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,6 +545,7 @@ impl Projection {
             telemetry,
             settings,
             themes,
+            mfi_chip,
         } = drivers;
         let cp_telemetry = CpTelemetry::new(devices.helper.clone());
         let cfg = hub.config();
@@ -583,6 +591,7 @@ impl Projection {
             apply_due: None,
             cluster,
             themes,
+            mfi_chip,
             theme_asked: String::new(),
             theme_ready: mpsc::unbounded_channel(),
             radio: None,
@@ -597,7 +606,7 @@ impl Projection {
     pub fn hear_airplay(
         &mut self,
         events: mpsc::UnboundedReceiver<ApEvent>,
-        audio: Arc<crate::airplay::ApAudio>,
+        audio: Arc<crate::projection::airplay::ApAudio>,
     ) {
         self.ap_events = Some(events);
         self.ap_audio = Some(audio);
@@ -712,17 +721,17 @@ impl Projection {
                     Err(broadcast::error::RecvError::Closed) => created = None,
                 },
                 ev = next_of(&mut host) => match ev {
-                    Ok(HostEvent::Started { plane: PLANE_MAIN }) => {
+                    Ok(OutputEvent::Started { plane: PLANE_MAIN }) => {
                         println!("[core] main video: first frame at the decoder");
                         self.main_video_shown();
                     }
-                    Ok(HostEvent::Started { plane: PLANE_AIRPLAY }) => {
+                    Ok(OutputEvent::Started { plane: PLANE_AIRPLAY }) => {
                         println!("[core] airplay video: first frame at the decoder");
                         self.ap_video_shown();
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[core] missed {n} gst-host events");
+                        eprintln!("[core] missed {n} output events");
                     }
                     Err(broadcast::error::RecvError::Closed) => host = None,
                 },

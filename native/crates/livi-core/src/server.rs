@@ -17,14 +17,14 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, broadcast, oneshot, watch};
 
-use crate::config_file::{ConfigFile, apply_patch};
+use crate::audio::spectrum::Viewer;
 use crate::devices::Shared;
 use crate::dongle::LinkSpeedViewer;
+use crate::files::config_file::{ConfigFile, apply_patch};
+use crate::files::status_file::Activity;
 use crate::hub::{Frame, Hub};
 use crate::projection::{UiCommand, UiSenders};
 use crate::radio::{Band, RadioAsk, Station};
-use crate::spectrum::Viewer;
-use crate::status_file::Activity;
 use crate::update::UpdateAsk;
 
 pub struct Core {
@@ -89,7 +89,13 @@ impl Core {
     pub async fn refresh_mfi(&self) -> Result<(), String> {
         let view = crate::mfi::read(&self.mfi_dir);
         let files = crate::mfi::digest(&self.mfi_dir);
-        self.hub.update(|s| s.mfi = view);
+        self.hub.update(|s| {
+            s.mfi = livi_core_proto::state::Mfi {
+                probed: s.mfi.probed,
+                chip: s.mfi.chip.take(),
+                ..view
+            }
+        });
         if self.hub.config().car_play_mfi_files == files {
             return Ok(());
         }
@@ -456,9 +462,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config_file::defaults;
+    use crate::files::config_file::defaults;
 
-    use crate::config_file::tests::TempDir;
+    use crate::files::config_file::tests::TempDir;
 
     struct Peer {
         stream: UnixStream,

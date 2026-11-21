@@ -17,13 +17,14 @@ use tokio::sync::{Notify, mpsc};
 
 use crate::bplist::{self, Value, dict};
 use crate::control_cipher::ControlCipher;
-use crate::crypto::hkdf_sha512;
 use crate::helper_sock::HelperSock;
 use crate::identity::Identity;
+use crate::mfi4::session::TunnelError;
 use crate::pair_setup::PairSetup;
 use crate::pair_verify::PairVerify;
 use crate::pairings::Pairings;
 use crate::rtsp::{self, Request, Response};
+use crate::session_keys;
 use crate::timing_sync::TimingSync;
 use crate::{auth_setup, mfi4, net, tlv8};
 
@@ -42,6 +43,7 @@ const AAC_ELD_48K: u64 = 1 << 25;
 const DISPLAY_UUID: &str = "4c495649-4d49-5252-4f52-000000000001";
 const CONNECT_WITHIN: Duration = Duration::from_secs(60);
 const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+const NO_SCREEN_AFTER: Duration = Duration::from_secs(1);
 const PLIST: &str = "application/x-apple-binary-plist";
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -165,6 +167,9 @@ pub trait AirplayMedia: Send + Sync {
     fn metadata(&self, id: u64, meta: AirplayMeta);
     fn volume(&self, db: f64);
     fn volume_db(&self) -> f64;
+    fn name(&self) -> String;
+    /// Width, height and frame rate of the screen the mirror shows on.
+    fn screen(&self) -> (u32, u32, u32);
 }
 
 pub struct AirplayCtx {
@@ -173,9 +178,8 @@ pub struct AirplayCtx {
     pub pairings: Pairings,
     pub helper: HelperSock,
     pub device_id: String,
-    pub name: String,
     pub source_version: String,
-    pub features: u64,
+    pub features: Arc<AtomicU64>,
     pub txt: Vec<String>,
     pub sample_rate: u32,
 }
@@ -229,6 +233,7 @@ struct Conn {
     id: u64,
     close: Arc<Notify>,
     started: bool,
+    mirror_since: Option<Instant>,
     sender: AirplaySender,
     remote: AirplayRemote,
     commands: Option<mpsc::UnboundedReceiver<AirplayCommand>>,
@@ -257,6 +262,7 @@ async fn connection(stream: TcpStream, peer: SocketAddr, ctx: Arc<AirplayCtx>) {
         id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
         close: Arc::new(Notify::new()),
         started: false,
+        mirror_since: None,
         sender: AirplaySender::default(),
         remote,
         commands: Some(commands),
@@ -272,6 +278,12 @@ async fn connection(stream: TcpStream, peer: SocketAddr, ctx: Arc<AirplayCtx>) {
         let read = tokio::select! {
             read = rd.read(&mut buf) => read,
             _ = ticker.tick() => {
+                // While carplay holds the phone's screen, iOS fails to resume the mirroring stream
+                // of a freshly activated endpoint and only manages on the next activation.
+                if conn.mirror_since.is_some_and(|t| t.elapsed() >= NO_SCREEN_AFTER) {
+                    println!("{TAG} {peer}: mirroring sent no screen, dropping it for a retry");
+                    break;
+                }
                 conn.tick();
                 continue;
             }
@@ -334,10 +346,8 @@ impl Conn {
                 && req.path.to_lowercase().ends_with("/pair-setup")
                 && let Some(k) = self.pair_setup.session_key()
             {
-                self.cipher = Some(ControlCipher::new(
-                    hkdf_sha512(&k, b"Control-Salt", b"Control-Write-Encryption-Key"),
-                    hkdf_sha512(&k, b"Control-Salt", b"Control-Read-Encryption-Key"),
-                ));
+                let (read, write) = session_keys::control(&k);
+                self.cipher = Some(ControlCipher::new(read, write));
             }
         }
         Ok(())
@@ -408,7 +418,10 @@ impl Conn {
             if asked_txt {
                 return plist(&dict([(
                     "txtAirPlay",
-                    Value::Data(txt_bytes(&self.ctx.txt)),
+                    Value::Data(txt_bytes(&livi_core_proto::features::with_features(
+                        &self.ctx.txt,
+                        self.ctx.features.load(Ordering::Relaxed),
+                    ))),
                 )]));
             }
             return plist(&self.info());
@@ -499,9 +512,9 @@ impl Conn {
             let mut check = |shown: &[u8]| {
                 let (expected, ours) = pair_verify
                     .transcript_proofs()
-                    .ok_or_else(|| "nothing to bind, pair-verify has not run".to_string())?;
+                    .ok_or(TunnelError::NotVerified)?;
                 if shown.get(..expected.len()) != Some(&expected[..]) {
-                    return Err("the phone's transcript proof does not match".to_string());
+                    return Err(TunnelError::ProofMismatch);
                 }
                 Ok(ours.to_vec())
             };
@@ -510,25 +523,28 @@ impl Conn {
                 .await;
             return octet(result);
         }
-        match auth_setup::handle(&req.body, &self.ctx.helper).await {
-            Ok(Some(body)) => octet(Ok(body)),
-            Ok(None) => status(400),
-            Err(e) => octet(Err(e)),
+        match auth_setup::handle(&req.body, &self.ctx.helper)
+            .await
+            .transpose()
+        {
+            Some(result) => octet(result),
+            None => status(400),
         }
     }
 
     fn info(&self) -> Value {
         let ctx = &self.ctx;
+        let (w, h, fps) = ctx.media.screen();
         let display = dict([
             ("uuid", Value::String(DISPLAY_UUID.into())),
             ("widthPhysical", Value::Int(0)),
             ("heightPhysical", Value::Int(0)),
-            ("widthPixels", Value::Int(1920)),
-            ("heightPixels", Value::Int(1080)),
-            ("width", Value::Int(1920)),
-            ("height", Value::Int(1080)),
-            ("maxFPS", Value::Int(60)),
-            ("refreshRate", Value::Real(1.0 / 60.0)),
+            ("widthPixels", Value::Int(w.into())),
+            ("heightPixels", Value::Int(h.into())),
+            ("width", Value::Int(w.into())),
+            ("height", Value::Int(h.into())),
+            ("maxFPS", Value::Int(fps.into())),
+            ("refreshRate", Value::Real(1.0 / f64::from(fps.max(1)))),
             ("overscanned", Value::Bool(false)),
             ("features", Value::Int(14)),
             ("rotation", Value::Bool(false)),
@@ -536,11 +552,11 @@ impl Conn {
         dict([
             ("deviceID", Value::String(ctx.device_id.clone())),
             ("macAddress", Value::String(ctx.device_id.clone())),
-            ("features", Value::Int(ctx.features)),
+            ("features", Value::Int(ctx.features.load(Ordering::Relaxed))),
             ("statusFlags", Value::Int(68)),
             ("model", Value::String("LIVI".into())),
             ("manufacturer", Value::String("LIVI".into())),
-            ("name", Value::String(ctx.name.clone())),
+            ("name", Value::String(ctx.media.name())),
             ("sourceVersion", Value::String(ctx.source_version.clone())),
             ("protocolVersion", Value::String("1.1".into())),
             ("pk", Value::Data(ctx.identity.public.to_vec())),
@@ -560,32 +576,34 @@ impl Conn {
     }
 
     fn event_keys(&self) -> Option<([u8; 32], [u8; 32])> {
-        let key = |k: &[u8]| {
-            (
-                hkdf_sha512(k, b"Events-Salt", b"Events-Read-Encryption-Key"),
-                hkdf_sha512(k, b"Events-Salt", b"Events-Write-Encryption-Key"),
-            )
-        };
         if self.transient {
-            return self.pair_setup.session_key().map(|k| key(&k));
+            return self
+                .pair_setup
+                .session_key()
+                .map(|k| session_keys::events(&k));
         }
-        self.pair_verify.shared_secret().map(|k| key(&k))
+        self.pair_verify
+            .shared_secret()
+            .map(|k| session_keys::events(&k))
     }
 
     fn stream_key(&self, sd: &Value) -> Option<[u8; 32]> {
         let k = self.pair_setup.session_key()?;
         let id = crate::stack::id_text(sd.get("streamConnectionID"));
-        Some(hkdf_sha512(
-            &k,
-            format!("DataStream-Salt{id}").as_bytes(),
-            b"DataStream-Output-Encryption-Key",
-        ))
+        Some(session_keys::data_stream(&k, &id, session_keys::DATA_OUT))
     }
 
     async fn setup(&mut self, req: &Request) -> Response {
         let Ok(body) = bplist::decode(&req.body) else {
             return status(400);
         };
+        if body
+            .get("isScreenMirroringSession")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.mirror_since = Some(Instant::now());
+        }
         let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
         if let Some(name) = text("name") {
             self.sender.name = Some(name);
@@ -610,6 +628,7 @@ impl Conn {
                     continue;
                 };
                 if kind == STREAM_SCREEN {
+                    self.mirror_since = None;
                     let port = screen_proxy(key, self.ctx.media.clone());
                     out.push(dict([
                         ("type", Value::Int(kind)),
@@ -1006,7 +1025,7 @@ fn pairing(body: Vec<u8>) -> Response {
     }
 }
 
-fn octet(result: Result<Vec<u8>, String>) -> Response {
+fn octet(result: Result<Vec<u8>, impl std::fmt::Display>) -> Response {
     match result {
         Ok(body) => Response {
             headers: vec![("Content-Type".into(), "application/octet-stream".into())],

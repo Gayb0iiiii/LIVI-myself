@@ -15,7 +15,7 @@ LIVI_SUDOERS_TEMPLATE="99-LIVI-helper.sudoers.template"
 LIVI_KIOSK_TEMPLATE="livi-kiosk.service.template"
 LIVI_BOOT_CONFIG="${LIVI_BOOT_CONFIG:-/boot/firmware/config.txt}"
 
-# I2C for the Apple MFi coprocessor, matching carPlayMfiI2cBus in config.json
+# I2C bus for the MFi i2c-gpio overlay
 LIVI_MFI_I2C_BUS=""
 LIVI_MFI_POWER_GPIO="21"
 LIVI_USER_DATA="${LIVI_USER_DATA:-${XDG_CONFIG_HOME:-$HOME/.config}/LIVI}"
@@ -127,7 +127,7 @@ livi_pick_channel() {
 # livi_fetch_appimage <dest> [source]
 # source is an optional local path or http(s) URL, otherwise the picked channel.
 livi_fetch_appimage() {
-  local dest="$1" src="${2:-}" arch url tmp
+  local dest="$1" src="${2:-}" arch url sha tmp
   mkdir -p "$(dirname "$dest")"
   tmp="$dest.download"
 
@@ -145,16 +145,21 @@ livi_fetch_appimage() {
   else
     arch="$(livi_asset_arch)" || return 1
     echo "→ Fetching the latest $LIVI_CHANNEL build for $arch"
-    url="$(curl -s "$LIVI_RELEASE_API" \
-      | grep browser_download_url \
-      | grep "linux-${arch}.AppImage" \
-      | cut -d '"' -f 4)"
-    if [ -z "$url" ]; then
+    read -r url sha < <(curl -fsSL "$LIVI_RELEASE_API" | awk -F'"' -v want="linux-${arch}.AppImage" '
+      /"digest":/ { d = $4 }
+      /"browser_download_url":/ && index($4, want) { sub(/^sha256:/, "", d); print $4, d; exit }
+    ') || true
+    if [ -z "${url:-}" ]; then
       echo "Error: no ${arch} AppImage in the latest $LIVI_CHANNEL build" >&2
+      return 1
+    fi
+    if [ -z "${sha:-}" ]; then
+      echo "Error: the $LIVI_CHANNEL build publishes no sha256 for $url" >&2
       return 1
     fi
     echo "   Download URL: $url"
     curl -fL "$url" --output "$tmp" || { rm -f "$tmp"; echo "Error: download failed" >&2; return 1; }
+    echo "$sha  $tmp" | sha256sum -c --status || { rm -f "$tmp"; echo "Error: $url does not match its sha256" >&2; return 1; }
   fi
 
   mv -f "$tmp" "$dest"
@@ -222,19 +227,32 @@ livi_install_video_mode_helper() {
 set -euo pipefail
 CMDLINE="/boot/firmware/cmdline.txt"
 arg="${1:-}"
-case "$arg" in
-  clear) new="" ;;
-  *)
-    [[ "$arg" =~ ^[A-Za-z0-9-]+:[0-9]+x[0-9]+@[0-9]+i?D?$ ]] || {
-      echo "usage: livi-video-mode.sh <CONNECTOR:WxH@Hz>|clear" >&2
-      exit 2
-    }
-    new="video=$arg"
-    ;;
-esac
 line="$(tr -d '\n' < "$CMDLINE")"
-stripped="$(sed -E 's/[[:space:]]*video=[^[:space:]]+//g' <<< "$line")"
-out="$stripped${new:+ $new}"
+read -ra words <<< "$line"
+if [ "$arg" = clear ]; then
+  kept=()
+  for w in "${words[@]}"; do
+    [[ "$w" == video=* ]] || kept+=("$w")
+  done
+  out="${kept[*]-}"
+else
+  [[ "$arg" =~ ^[A-Za-z0-9-]+:[0-9]+x[0-9]+@[0-9]+i?D?$ ]] || {
+    echo "usage: livi-video-mode.sh <CONNECTOR:WxH@Hz>|clear" >&2
+    exit 2
+  }
+  connector="${arg%%:*}"
+  found=""
+  for i in "${!words[@]}"; do
+    w="${words[$i]}"
+    [[ "$w" == "video=$connector:"* ]] || continue
+    options=""
+    [[ "$w" == *,* ]] && options=",${w#*,}"
+    words[$i]="video=$arg$options"
+    found=1
+  done
+  [ -n "$found" ] || words+=("video=$arg")
+  out="${words[*]}"
+fi
 [ "$out" = "$line" ] || echo "$out" > "$CMDLINE"
 EOF
 }
@@ -647,10 +665,10 @@ livi_seed_mfi_config() {
   livi_require_jq || return 1
   mkdir -p "$(dirname "$LIVI_APP_CONFIG")"
   cfg="$(livi_app_config_jq '
-    .carPlayMfiI2cBus = $bus
+    del(.carPlayMfiI2cBus)
     | if .carPlayMfiPowerGpio == null or .carPlayMfiPowerGpio == "" or .carPlayMfiPowerGpio == -1
       then .carPlayMfiPowerGpio = $gpio else . end' \
-    --argjson bus "$LIVI_MFI_I2C_BUS" --argjson gpio "$LIVI_MFI_POWER_GPIO")" || return 1
+    --argjson gpio "$LIVI_MFI_POWER_GPIO")" || return 1
   [ -n "$cfg" ] || return 1
   printf '%s\n' "$cfg" > "$LIVI_APP_CONFIG"
 }
@@ -701,7 +719,7 @@ livi_apply_mfi() {
   local dev="/dev/i2c-${LIVI_MFI_I2C_BUS}"
   local overlay="dtoverlay=i2c-gpio,bus=${LIVI_MFI_I2C_BUS},i2c_gpio_sda=19,i2c_gpio_scl=26,i2c_gpio_delay_us=5"
 
-  echo "→ Setting MFi i2c bus ${LIVI_MFI_I2C_BUS} and power pin ${LIVI_MFI_POWER_GPIO} in the app config"
+  echo "→ Setting MFi power pin ${LIVI_MFI_POWER_GPIO} in the app config"
   livi_seed_mfi_config
 
   echo "→ Enabling I2C for the MFi coprocessor"
