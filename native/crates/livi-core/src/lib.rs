@@ -19,9 +19,11 @@ mod camera;
 mod devices;
 mod dongle;
 mod files;
+#[cfg(feature = "net")]
 mod fonts;
 mod gnss;
 mod helper;
+#[cfg(feature = "net")]
 mod http;
 mod hub;
 mod mfi;
@@ -33,7 +35,10 @@ mod services;
 mod system;
 #[cfg(target_os = "linux")]
 mod system_statistics;
+#[cfg(feature = "uart-module")]
+mod uart_module;
 mod ui;
+#[cfg_attr(not(feature = "net"), allow(dead_code, unused_imports))]
 mod update;
 mod vehicle;
 
@@ -159,11 +164,21 @@ pub async fn run(
     tokio::spawn(vehicle::car_bridge::run(core.clone(), inside.clone()));
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     tokio::spawn(audio::system_volume::follow(core.clone()));
+    #[cfg(target_os = "linux")]
+    tokio::spawn(system::backlight::follow(core.clone()));
+    #[cfg(feature = "uart-module")]
+    tokio::spawn(system::keys::follow(core.clone()));
+    #[cfg(feature = "uart-module")]
+    uart_module::start();
+    #[cfg(feature = "net")]
     tokio::spawn(update::run(
         core.clone(),
         update_asks,
         res.installer.clone(),
     ));
+    #[cfg(not(feature = "net"))]
+    drop(update_asks);
+    #[cfg(feature = "net")]
     tokio::spawn(fonts::follow(core.clone(), user_data.join("fonts")));
     files::state_files::start(&core, core.activity(), &user_data);
     tokio::spawn(audio::audio_devices::follow(
@@ -227,6 +242,7 @@ pub async fn run(
         _ = stop => {}
         _ = quit.notified() => println!("[core] stopping"),
     }
+    core.flush_config();
     let _ = tokio::time::timeout(Duration::from_secs(2), system::gvfs_guard::stop()).await;
     #[cfg(target_os = "linux")]
     statistics_task.abort();

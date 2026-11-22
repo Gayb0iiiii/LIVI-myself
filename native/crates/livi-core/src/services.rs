@@ -295,7 +295,7 @@ impl Services {
             hub.clone(),
             settings.clone(),
         ));
-        #[cfg(usb_host)]
+        #[cfg(all(usb_host, feature = "sdr"))]
         if let Some(radio_asks) = asks.radio.take() {
             tokio::spawn(crate::radio::run(
                 hub.clone(),
@@ -306,7 +306,7 @@ impl Services {
                 resume_radio,
             ));
         }
-        #[cfg(not(usb_host))]
+        #[cfg(not(all(usb_host, feature = "sdr")))]
         let _ = (asks.radio.take(), resume_radio);
 
         let carplay = CarPlay {
@@ -341,6 +341,7 @@ impl Services {
             clusters.clone(),
         ));
         tokio::spawn(follow_audio_output(state.clone(), gst.clone()));
+        tokio::spawn(follow_muted(state.clone(), gst.clone()));
         tokio::spawn(follow_host(gst, plane, airplay_plane, clusters, state));
 
         Self {
@@ -651,14 +652,21 @@ async fn follow_state(
                 s.sessions.held,
             )
         };
+        if last.as_ref().is_none_or(|l| l.front != now.front) {
+            let f = &now.front;
+            let cluster_on_main = f.main == Front::Cluster;
+            if cluster_on_main {
+                plane.give_way(true);
+            }
+            clusters.show_on([f.main, f.cluster, f.aux].map(|f| f == Front::Cluster));
+            if !cluster_on_main {
+                plane.give_way(false);
+            }
+        }
         if last.as_ref().is_none_or(|l| shown(l) != shown(&now)) {
             let (projection, mirrored, held) = shown(&now);
             plane.set_visible(projection && !mirrored);
             airplay.set_visible(projection && mirrored && !held);
-        }
-        if last.as_ref().is_none_or(|l| l.front != now.front) {
-            let f = &now.front;
-            clusters.show_on([f.main, f.cluster, f.aux].map(|f| f == Front::Cluster));
         }
         last = Some(now);
         if state.changed().await.is_err() {
@@ -744,6 +752,17 @@ async fn follow_audio_output(mut state: watch::Receiver<State>, gst: Output) {
         if now != device {
             gst.set_audio_output(now.as_deref().unwrap_or(""));
             device = now;
+        }
+    }
+}
+
+async fn follow_muted(mut state: watch::Receiver<State>, gst: Output) {
+    let mut muted = false;
+    while state.changed().await.is_ok() {
+        let now = state.borrow_and_update().system.muted;
+        if now != muted {
+            gst.set_audio_muted(now);
+            muted = now;
         }
     }
 }

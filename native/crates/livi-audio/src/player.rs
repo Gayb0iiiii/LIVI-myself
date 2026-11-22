@@ -53,6 +53,8 @@ const fn audio_sink() -> (&'static str, &'static str) {
         ("osxaudiosink", "unique-id")
     } else if cfg!(target_os = "android") {
         ("aaudiosink", "device")
+    } else if cfg!(livi_os) {
+        ("alsasink", "device")
     } else {
         ("pulsesink", "device")
     }

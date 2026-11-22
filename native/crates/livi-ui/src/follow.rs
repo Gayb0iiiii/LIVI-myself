@@ -29,7 +29,7 @@ pub enum Update {
     Settings,
     Spectrum(Vec<f32>),
     Open(String),
-    Volume(f64),
+    Volume(livi_ui_model::overlay::Level),
     PhoneName(String),
     Camera(bool),
     MainMask(Option<Mask>),
@@ -194,6 +194,7 @@ impl Follow {
             }
         }
         if hit("system") {
+            crate::clock::set_offset(state.system.utc_offset_minutes);
             let fonts = state.system.fonts.clone();
             if self.fonts.as_ref() != Some(&fonts) {
                 self.fonts = Some(fonts.clone());
@@ -210,7 +211,7 @@ impl Follow {
         {
             out.push(Update::Settings);
         }
-        if hit("config")
+        if (hit("config") || hit("system"))
             && let Some(level) = self.volume.update(state)
         {
             out.push(Update::Volume(level));

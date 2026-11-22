@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
+#[cfg(target_os = "linux")]
+pub mod backlight;
 pub mod child;
 pub mod gvfs_guard;
 pub mod host;
 pub mod host_setup;
 pub mod hwaddr;
+#[cfg(feature = "uart-module")]
+pub mod keys;
 pub mod kiosk_unit;
 pub mod power;
 pub mod privileged;

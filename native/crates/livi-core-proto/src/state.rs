@@ -283,10 +283,16 @@ pub struct System {
     pub wifi_countries: Vec<String>,
     pub displays: Vec<Display>,
     pub displays_settable: bool,
+    pub mfi_on_board: bool,
     pub audio_sinks: Vec<AudioDevice>,
     pub audio_sources: Vec<AudioDevice>,
     pub start_page: String,
     pub fonts: Vec<String>,
+    pub utc_offset_minutes: Option<i32>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub display_off: bool,
 }
 
 /// Host measurements. Missing or unsupported readings stay null, never zero.

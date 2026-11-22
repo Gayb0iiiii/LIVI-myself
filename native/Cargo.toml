@@ -6,6 +6,9 @@ exclude = ["vendor"]
 [patch.crates-io]
 femtovg = { path = "vendor/femtovg" }
 i-slint-backend-android-activity = { path = "vendor/i-slint-backend-android-activity" }
+i-slint-backend-linuxkms = { path = "vendor/i-slint-backend-linuxkms" }
+i-slint-renderer-software = { path = "vendor/i-slint-renderer-software" }
+parley_engine = { path = "vendor/parley_engine" }
 
 [workspace.package]
 version = "10.6.0"
@@ -14,6 +17,9 @@ description = "LIVI - Linux In-Vehicle Infotainment"
 homepage = "https://f-io.dev"
 authors = ["Lasse Heitgres"]
 license = "GPL-3.0-or-later"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(livi_os)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
@@ -47,7 +53,7 @@ thiserror = "2.0.21"
 tokio = "1.54.1"
 tokio-util = "0.7.20"
 uuid = "1.29.3"
-zbus = { version = "6.3.0", default-features = false }
+zbus = { version = "6.5.0", default-features = false }
 
 iap2-csm = { path = "crates/iap2-csm" }
 iap2-link = { path = "crates/iap2-link" }
@@ -70,8 +76,9 @@ livi-cp = { path = "crates/livi-cp", default-features = false }
 livi-crypto = { path = "crates/livi-crypto" }
 livi-dab = { path = "crates/livi-dab" }
 livi-fm = { path = "crates/livi-fm" }
-livi-helper = { path = "crates/livi-helper" }
-livi-helper-stack = { path = "crates/livi-helper-stack" }
+livi-helper = { path = "crates/livi-helper", default-features = false }
+livi-helper-stack = { path = "crates/livi-helper-stack", default-features = false }
+livi-helperd = { path = "crates/livi-helperd", default-features = false }
 livi-hfp = { path = "crates/livi-hfp" }
 livi-link-ap = { path = "crates/livi-link-ap" }
 livi-link-hci = { path = "crates/livi-link-hci" }
@@ -93,6 +100,7 @@ livi-video-player = { path = "crates/livi-video-player" }
 livi-video-view = { path = "crates/livi-video-view" }
 livi-web = { path = "crates/livi-web" }
 livi-wifi = { path = "crates/livi-wifi" }
+livid = { path = "crates/livid" }
 
 # The DAB+ and FM receivers demodulate in real time, also in debug builds.
 [profile.dev.package.livi-dab]

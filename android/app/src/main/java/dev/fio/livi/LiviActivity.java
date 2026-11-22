@@ -58,13 +58,14 @@ public class LiviActivity extends NativeActivity {
     private final SparseArray<SurfaceView> planes = new SparseArray<>();
     private final AtomicInteger lastPlane = new AtomicInteger();
     private FrameLayout stage;
+    private volatile boolean kiosk;
 
     static {
         System.loadLibrary("gstreamer_android");
         System.loadLibrary("livi");
     }
 
-    private static native void key(int scancode, boolean down, boolean repeat);
+    private static native void key(int scancode, int typed, boolean down, boolean repeat);
 
     private static native void surface(int plane, Surface surface);
 
@@ -218,23 +219,36 @@ public class LiviActivity extends NativeActivity {
     }
 
     private void kiosk(boolean on) {
-        runOnUiThread(() -> {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                getWindow().getDecorView().setSystemUiVisibility(on
-                        ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                                | View.SYSTEM_UI_FLAG_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                        : 0);
-                return;
-            }
-            WindowInsetsController bars = getWindow().getInsetsController();
-            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-            if (on) {
-                bars.hide(WindowInsets.Type.systemBars());
-            } else {
-                bars.show(WindowInsets.Type.systemBars());
-            }
-        });
+        kiosk = on;
+        runOnUiThread(this::applyKiosk);
+    }
+
+    // Android drops the bars' flags when the app loses the focus, minimized or behind another app.
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && kiosk) {
+            applyKiosk();
+        }
+    }
+
+    private void applyKiosk() {
+        boolean on = kiosk;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            getWindow().getDecorView().setSystemUiVisibility(on
+                    ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    : 0);
+            return;
+        }
+        WindowInsetsController bars = getWindow().getInsetsController();
+        bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        if (on) {
+            bars.hide(WindowInsets.Type.systemBars());
+        } else {
+            bars.show(WindowInsets.Type.systemBars());
+        }
     }
 
     private void exit(boolean restart) {
@@ -385,7 +399,11 @@ public class LiviActivity extends NativeActivity {
                 || (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP)) {
             return super.dispatchKeyEvent(event);
         }
-        key(event.getScanCode(), action == KeyEvent.ACTION_DOWN, event.getRepeatCount() > 0);
+        key(
+                event.getScanCode(),
+                event.getUnicodeChar(),
+                action == KeyEvent.ACTION_DOWN,
+                event.getRepeatCount() > 0);
         return true;
     }
 }
