@@ -153,10 +153,11 @@ fn serve(start: HelperStart, host: Host) -> Held {
     let chip = chip(&start, &host);
     let own_chip = chip.is_some();
     let link = watch_link(&host);
-    let kernel_bt = cfg!(feature = "bluez") && livi_core_proto::helper::kernel_bluetooth();
     let bt_adapter = start.settings.bt_adapter.as_str();
     let over_dongle =
         bt_adapter == livi_link_host::link::CHOICE || bt_adapter == livi_core_proto::helper::MODULE;
+    let kernel_bt =
+        !over_dongle && cfg!(feature = "bluez") && livi_core_proto::helper::kernel_bluetooth();
     let dongle_ap = start.settings.wifi_iface == livi_link_host::link::CHOICE;
     let dongle = crate::bt_dongle::Dongle::default();
     let auth = SharedCoprocessor::new(chip.unwrap_or_else(|| Box::new(NoCoprocessor)));
@@ -188,7 +189,7 @@ fn serve(start: HelperStart, host: Host) -> Held {
     let wireless = (!over_dongle && (carplay || android_auto)).then(|| {
         (
             livi_helper_stack::ident::Identity {
-                bt_mac: livi_link_host::ap::address(&start.device_id).unwrap_or(identity.bt_mac),
+                bt_mac: livi_base::hex::parse_mac(&start.device_id).unwrap_or(identity.bt_mac),
                 ..identity.clone()
             },
             livi_helper_stack::bringup::CpConfig {
@@ -204,6 +205,7 @@ fn serve(start: HelperStart, host: Host) -> Held {
         disconnect: None,
         targets: None,
         cp_live: None,
+        bt_mac_live: None,
     };
     #[cfg(all(target_os = "linux", feature = "bluez"))]
     let sock = if kernel_bt {
@@ -230,7 +232,11 @@ fn serve(start: HelperStart, host: Host) -> Held {
         let (base, live_wifi) = (cp.clone(), wifi.clone());
         let dongle = dongle.clone();
         LiviSockConfig {
-            identity: crate::dongle::wireless_identity(&identity, module),
+            bt_mac_live: Some(if module {
+                livi_core_proto::helper::module_bt_mac
+            } else {
+                livi_link_host::ap::bt_mac
+            }),
             cp: crate::dongle::wireless_config(&cp, &wifi),
             disconnect: Some(Arc::new(move |mac: String| {
                 dongle.disconnect(&mac).map_err(Into::into)

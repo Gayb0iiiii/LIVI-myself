@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use livi_link_ap::radio::{self, Radio};
 
@@ -26,15 +26,15 @@ pub(crate) fn bt_json() -> String {
     let bt = caps().bt.as_str();
     let mut mac = read_trim(&format!("/sys/class/bluetooth/{bt}/address"));
     if mac.is_empty() {
-        mac = read_trim("/tmp/livi/bt-mac");
+        mac = read_trim(livi_base::run::BT_MAC);
     }
     let mut name = read_trim(&format!("/sys/class/bluetooth/{bt}/name"));
     if name.is_empty() {
         name = livi_link_ap::server::ap_name_from(
-            std::path::Path::new(HOSTAPD_BASE),
+            std::path::Path::new(livi_base::run::HOSTAPD_BASE),
             &[
-                std::path::Path::new(HOSTAPD_LIVE[0]),
-                std::path::Path::new(HOSTAPD_LIVE[1]),
+                std::path::Path::new(livi_base::run::HOSTAPD_LIVE[0]),
+                std::path::Path::new(livi_base::run::HOSTAPD_LIVE[1]),
             ],
         )
         .unwrap_or_default();
@@ -58,10 +58,6 @@ pub(crate) fn bt_json() -> String {
     )
 }
 
-pub(crate) const HOSTAPD_BASE: &str = "/tmp/livi/hostapd.conf.saved";
-
-pub(crate) const HOSTAPD_LIVE: [&str; 2] = ["/tmp/livi/hostapd.conf", "/tmp/livi/hostapd.alt"];
-
 pub(crate) fn wifi_json() -> String {
     let iface = caps().wifi_iface.as_str();
     let mut ssid = String::new();
@@ -76,10 +72,10 @@ pub(crate) fn wifi_json() -> String {
     }
     if ssid.is_empty() {
         let cfg = livi_link_ap::server::ap_config_from(
-            std::path::Path::new(HOSTAPD_BASE),
+            std::path::Path::new(livi_base::run::HOSTAPD_BASE),
             &[
-                std::path::Path::new(HOSTAPD_LIVE[0]),
-                std::path::Path::new(HOSTAPD_LIVE[1]),
+                std::path::Path::new(livi_base::run::HOSTAPD_LIVE[0]),
+                std::path::Path::new(livi_base::run::HOSTAPD_LIVE[1]),
             ],
         );
         if let Some(cfg) = cfg {
@@ -153,20 +149,37 @@ pub(crate) fn status_json() -> String {
     )
 }
 
-/// How busy the CPU was since the previous status request, empty on the first. The load average
-/// counts threads that wait as well, so it reads above 1 on a single core that is not full.
+struct CpuSample {
+    at: Instant,
+    times: (u64, u64),
+    shown: String,
+}
+
 fn cpu_percent() -> String {
-    static PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    const MIN_SPAN: Duration = Duration::from_secs(1);
+    static LAST: Mutex<Option<CpuSample>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = last.as_ref()
+        && s.at.elapsed() < MIN_SPAN
+    {
+        return s.shown.clone();
+    }
     let Some(now) = fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|s| cpu_times(&s))
     else {
         return String::new();
     };
-    match PREV.lock().unwrap().replace(now) {
-        Some(prev) => busy_percent(prev, now).map_or(String::new(), |p| format!("{p} %")),
-        None => String::new(),
-    }
+    let shown = last
+        .as_ref()
+        .and_then(|s| busy_percent(s.times, now))
+        .map_or(String::new(), |p| format!("{p} %"));
+    *last = Some(CpuSample {
+        at: Instant::now(),
+        times: now,
+        shown: shown.clone(),
+    });
+    shown
 }
 
 /// Busy and total jiffies of all CPUs from /proc/stat, idle and iowait are the idle part.

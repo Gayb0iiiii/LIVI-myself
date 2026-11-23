@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const CLAIM_FILE: &str = "/tmp/livi-gps-clock";
 const CLAIM_MAX_AGE_S: u64 = 120;
 const STEP_THRESHOLD_S: i64 = 2;
 
 fn gps_owns_clock() -> bool {
-    let Ok(meta) = std::fs::metadata(CLAIM_FILE) else {
+    let Ok(meta) = std::fs::metadata(livi_base::run::GPS_CLOCK) else {
         return false;
     };
     let Ok(modified) = meta.modified() else {
@@ -42,20 +40,9 @@ pub fn step_to(secs: i64) {
         println!("[cp] device time: offset {offset}s, keeping the system clock");
         return;
     }
-    let at = libc::timespec {
-        tv_sec: secs as _,
-        tv_nsec: 0,
-    };
-    // SAFETY: at is a valid timespec for the call.
-    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &at) } != 0 {
-        eprintln!(
-            "[cp] device time: setting the clock failed: {}",
-            std::io::Error::last_os_error()
-        );
+    if let Err(e) = livi_base::time::set_clock(secs) {
+        eprintln!("[cp] device time: setting the clock failed: {e}");
         return;
     }
-    let _ = Command::new(livi_base::sys::tool("fake-hwclock"))
-        .arg("save")
-        .output();
     println!("[cp] device time: system clock stepped by {offset}s");
 }

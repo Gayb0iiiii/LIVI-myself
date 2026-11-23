@@ -20,7 +20,7 @@ num-bigint = "0.5.1"
 openssl = { version = "0.10.82", optional = true }
 openssl-sys = { version = "0.9.118", optional = true }
 p256 = "0.14.0"
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 socket2 = { workspace = true, features = ["all"] }
@@ -41,7 +41,12 @@ livi-net.workspace = true
 rustls-native-certs = "0.8"
 
 [dev-dependencies]
+openssl = "0.10.82"
+tokio-openssl = "0.6.5"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "test-util"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))'.dev-dependencies]
+openssl = { version = "0.10.82", features = ["vendored"] }
 
 [lints]
 workspace = true

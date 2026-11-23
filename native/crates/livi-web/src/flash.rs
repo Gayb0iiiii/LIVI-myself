@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use livi_base::run::LED_DIR;
+
 use crate::http::{S_200, S_400, S_500, T_JSON, err_json, js, ok_json};
 use crate::{Flash, HandOver, MtdSlot, WebCaps};
 
@@ -263,8 +265,6 @@ pub(crate) fn post_write_check(f: &Flash) -> Result<(), String> {
     }
 }
 
-pub(crate) const LED_DIR: &str = "/tmp/livi/led";
-
 pub(crate) fn led_flash_set(state: Option<&str>) {
     let _ = fs::create_dir_all(LED_DIR);
     for f in ["flash-mode", "flash-done", "flash-error"] {
@@ -375,8 +375,15 @@ pub(crate) fn verify_flash(path: &str, expected: &[u8]) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn reboot_soon() -> (&'static str, &'static str, Vec<u8>) {
-    reboot_after(Duration::from_millis(500), None);
+pub(crate) fn reboot_soon(f: &Flash) -> (&'static str, &'static str, Vec<u8>) {
+    let delay = match f.hand_over {
+        Some(hand) => {
+            let _ = (hand.take)();
+            Duration::from_millis(1500)
+        }
+        None => Duration::from_millis(500),
+    };
+    reboot_after(delay, None);
     (S_200, T_JSON, ok_json("rebooting"))
 }
 

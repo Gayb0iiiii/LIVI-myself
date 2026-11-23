@@ -14,7 +14,7 @@ mod bt_up;
 mod btd;
 #[cfg(target_os = "linux")]
 mod config;
-#[cfg(all(target_os = "linux", not(target_arch = "riscv32")))]
+#[cfg(all(target_os = "linux", feature = "imx6ul"))]
 mod imx6ul;
 #[cfg(target_os = "linux")]
 mod ledd;
@@ -37,7 +37,7 @@ fn board() -> (&'static str, &'static str) {
     if has(b"livi,f133b-xfh") {
         return ("F133-XFH", "f133b_xfh");
     }
-    #[cfg(not(target_arch = "riscv32"))]
+    #[cfg(feature = "imx6ul")]
     if has(b"livi,link-imx6ull") {
         return imx6ul::module();
     }
@@ -99,7 +99,7 @@ fn web_caps(args: &[String]) -> livi_web::WebCaps {
                 ..Default::default()
             },
         ),
-        #[cfg(not(target_arch = "riscv32"))]
+        #[cfg(feature = "imx6ul")]
         t if t.starts_with("imx6ul_") => (
             false,
             livi_web::Flash {
@@ -141,7 +141,7 @@ fn web_caps(args: &[String]) -> livi_web::WebCaps {
         bt: "hci0".into(),
         led,
         flash,
-        update_conf: "/tmp/livi/update.conf".into(),
+        update_conf: livi_base::run::UPDATE_CONF.into(),
     }
 }
 
@@ -168,25 +168,39 @@ pub fn main() -> ExitCode {
         (basename, args[1..].to_vec())
     };
 
-    let rc = match cmd {
-        "livi-bt-up" | "bt-up" => bt_up::run(rest),
+    let rc = dispatch(cmd, rest).unwrap_or_else(|| {
+        eprintln!("livid: unknown command '{cmd}'");
+        2
+    });
+    ExitCode::from(rc.clamp(0, 255) as u8)
+}
+
+#[cfg(target_os = "linux")]
+pub fn applet(name: &str) -> Option<ExitCode> {
+    if name == "livid" {
+        return Some(main());
+    }
+    let rc = dispatch(name, env::args().skip(1).collect())?;
+    Some(ExitCode::from(rc.clamp(0, 255) as u8))
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch(cmd: &str, rest: Vec<String>) -> Option<i32> {
+    Some(match cmd.strip_prefix("livi-").unwrap_or(cmd) {
+        "bt-up" => bt_up::run(rest),
         "bt-probe" => exit_rc(livi_link_hci::probe()),
-        "livi-btd" | "btd" => btd::run(rest),
-        "livi-httpd" | "httpd" => livi_web::run(web_caps(&rest)),
-        "livi-mdnsd" | "mdnsd" => exit_rc(livi_mdns::daemon::run(&rest)),
-        "livi-ledd" | "ledd" => ledd::run(rest),
-        "livi-netd" | "netd" => netd::run(rest),
+        "btd" => btd::run(rest),
+        "httpd" => livi_web::run(web_caps(&rest)),
+        "mdnsd" => exit_rc(livi_mdns::daemon::run(&rest)),
+        "ledd" => ledd::run(rest),
+        "netd" => netd::run(rest),
         "config" => config::run(rest),
-        "livi-mfid" | "mfid" => mfid::run(),
-        "livi-wifid" | "wifid" => wifid::run(rest),
+        "mfid" => mfid::run(),
+        "wifid" => wifid::run(rest),
         #[cfg(feature = "screen")]
         "splash" => screen::splash(),
-        _ => {
-            eprintln!("livid: unknown command '{}'", cmd);
-            2
-        }
-    };
-    ExitCode::from(rc.clamp(0, 255) as u8)
+        _ => return None,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

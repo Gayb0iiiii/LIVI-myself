@@ -12,22 +12,19 @@ mod local {
     pub use crate::usb_pipe::open_stream;
 
     pub fn find_iphones() -> Vec<PhoneInfo> {
-        crate::linux::find_iphones()
-            .into_iter()
-            .map(|d| PhoneInfo {
-                serial: d.serial,
-                num_configs: d.num_configs,
-                config_value: d.config_value,
-            })
-            .collect()
+        crate::linux::find_iphones().into_iter().map(info).collect()
     }
 
     pub fn ensure_carplay_config(serial: &str) -> Result<PhoneInfo, Error> {
-        crate::linux::ensure_carplay_config(serial).map(|d| PhoneInfo {
+        crate::linux::ensure_carplay_config(serial).map(info)
+    }
+
+    fn info(d: crate::linux::IPhoneDev) -> PhoneInfo {
+        PhoneInfo {
             serial: d.serial,
             num_configs: d.num_configs,
             config_value: d.config_value,
-        })
+        }
     }
 
     pub fn restore_default_config(serial: &str) {
