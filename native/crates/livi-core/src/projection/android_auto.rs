@@ -435,8 +435,9 @@ impl AaMedia for GstAaMedia {
             clock_rate: sample_rate,
             channels: channels.min(u32::from(u8::MAX)) as u8,
             latency_ms: 0,
-            realtime: false,
+            realtime: None,
             fed: true,
+            paced: false,
             device: self
                 .state
                 .borrow()
@@ -613,6 +614,7 @@ mod tests {
             },
             sessions: Default::default(),
             now_playing: Default::default(),
+            audio: None,
             video_playback: None,
             telemetry: Default::default(),
             navigation: Default::default(),

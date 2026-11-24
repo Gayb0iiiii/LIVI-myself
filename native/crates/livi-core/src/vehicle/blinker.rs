@@ -174,8 +174,9 @@ async fn open(gst: &Output, device: &str) -> Option<Stream> {
         clock_rate: RATE,
         channels: CHANNELS,
         latency_ms: 0,
-        realtime: true,
+        realtime: Some(true),
         fed: true,
+        paced: false,
         device: device.to_string(),
     };
     let (id, _, _) = gst.open_audio(&[0; 32], &opts).await;
@@ -338,6 +339,7 @@ mod tests {
             front: livi,
             sessions: Default::default(),
             now_playing: Default::default(),
+            audio: None,
             video_playback: None,
             navigation: Default::default(),
             system: Default::default(),

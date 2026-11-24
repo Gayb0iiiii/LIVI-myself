@@ -4589,6 +4589,7 @@ dependencies = [
  "livi-video",
  "livi-video-player",
  "livi-video-view",
+ "objc2-foundation 0.3.2",
  "realfft",
 ]
 

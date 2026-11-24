@@ -17,6 +17,8 @@ pub struct State {
     pub sessions: Sessions,
     pub now_playing: NowPlaying,
     #[serde(default)]
+    pub audio: Option<AudioStream>,
+    #[serde(default)]
     pub video_playback: Option<VideoPlayback>,
     pub navigation: Navigation,
     pub system: System,
@@ -41,6 +43,7 @@ impl State {
             "front" => self.front = read(value)?,
             "sessions" => self.sessions = read(value)?,
             "nowPlaying" => self.now_playing = read(value)?,
+            "audio" => self.audio = read(value)?,
             "videoPlayback" => self.video_playback = read(value)?,
             "navigation" => self.navigation = read(value)?,
             "system" => self.system = read(value)?,
@@ -432,6 +435,20 @@ pub struct NowPlaying {
     pub elapsed_ms: Option<f64>,
     pub playing: Option<bool>,
     pub artwork: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioStream {
+    pub codec: String,
+    pub rate: u32,
+    pub bits: u8,
+    pub channels: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffered: Option<bool>,
+    pub buffer_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
