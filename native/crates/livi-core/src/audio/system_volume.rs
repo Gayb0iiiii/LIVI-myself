@@ -63,7 +63,7 @@ mod output {
     }
 }
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "android"))]
 mod output {
     use tokio::sync::mpsc;
 
@@ -78,11 +78,11 @@ mod output {
     }
 
     pub async fn get(_device: &str) -> Result<f64, Fault> {
-        crate::audio::ios_volume::get().ok_or(Fault::Missing)
+        crate::audio::device_volume::get().ok_or(Fault::Missing)
     }
 
     pub async fn set(_device: &str, level: f64) -> Result<(), Fault> {
-        crate::audio::ios_volume::set(level);
+        crate::audio::device_volume::set(level);
         Ok(())
     }
 
@@ -92,7 +92,7 @@ mod output {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
             loop {
                 tick.tick().await;
-                if let Some(v) = crate::audio::ios_volume::get()
+                if let Some(v) = crate::audio::device_volume::get()
                     && last.is_none_or(|l| (v - l).abs() >= SAME)
                 {
                     last = Some(v);
@@ -111,7 +111,7 @@ const SAME: f64 = 0.005;
 
 pub enum Fault {
     Missing,
-    #[cfg_attr(target_os = "ios", allow(dead_code))]
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
     Other(String),
 }
 
@@ -127,7 +127,7 @@ impl std::fmt::Display for Fault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputEvent {
     Changed,
-    #[cfg_attr(target_os = "ios", allow(dead_code))]
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(dead_code))]
     New,
 }
 
@@ -215,6 +215,7 @@ pub async fn follow(core: Arc<Core>) {
     let (tx, mut events) = mpsc::unbounded_channel();
     let mut read_at: Option<Instant> = None;
     let mut last: Option<f64> = None;
+    let mut unreadable = false;
     loop {
         let (level, linked, device, muted) = {
             let s = state.borrow_and_update();
@@ -235,14 +236,16 @@ pub async fn follow(core: Arc<Core>) {
                 watcher = Some(output::watch(tx.clone()));
                 println!("[volume] watching the output for changes made outside LIVI");
             }
-            let level = mixer.get(device.as_deref()).await;
-            match level {
-                Some(level) => take_system_level(&core, level, "starts from the system").await,
-                None => mixer.set(target, device.as_deref()).await,
+            if let Some(level) = mixer.get(device.as_deref()).await {
+                take_system_level(&core, level, "starts from the system").await;
+                following = Some(device);
+                applied = Some(level);
+                last = Some(level);
+                unreadable = false;
+            } else if !unreadable {
+                unreadable = true;
+                eprintln!("[volume] the system volume cannot be read, LIVI leaves it as it is");
             }
-            following = Some(device);
-            applied = Some(level.unwrap_or(target));
-            last = level;
         } else if applied.is_none_or(|a| (target - a).abs() >= SAME) {
             applied = Some(target);
             mixer

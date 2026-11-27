@@ -15,7 +15,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageInstaller;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
-import android.media.session.MediaSession;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -34,6 +34,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.FrameLayout;
 import java.io.File;
 import java.io.FileInputStream;
@@ -60,14 +61,14 @@ public class LiviActivity extends NativeActivity {
     private final AtomicInteger lastPlane = new AtomicInteger();
     private FrameLayout stage;
     private volatile boolean kiosk;
-    private MediaSession mediaSession;
+    private LiviMedia mediaSession;
 
     static {
         System.loadLibrary("gstreamer_android");
         System.loadLibrary("livi");
     }
 
-    private static native void key(int scancode, int typed, boolean down, boolean repeat);
+    private static native void key(int keycode, int scancode, int typed, boolean down, boolean repeat);
 
     static native void media(int control);
 
@@ -97,6 +98,7 @@ public class LiviActivity extends NativeActivity {
         bluetoothAddress(LiviBluetooth.address(this));
         super.onCreate(state);
         getWindow().setFormat(PixelFormat.TRANSLUCENT);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         List<String> wanted = new ArrayList<>(Arrays.asList(LiviBluetooth.PERMISSIONS));
         wanted.addAll(Arrays.asList(LiviHotspot.PERMISSIONS));
         wanted.add(Manifest.permission.RECORD_AUDIO);
@@ -109,7 +111,7 @@ public class LiviActivity extends NativeActivity {
         });
         addContentView(stage, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        mediaSession = LiviMedia.start(this);
+        mediaSession = new LiviMedia(this);
     }
 
     @Override
@@ -239,9 +241,31 @@ public class LiviActivity extends NativeActivity {
     private void mediaState(boolean playing) {
         runOnUiThread(() -> {
             if (mediaSession != null) {
-                LiviMedia.setPlaying(mediaSession, playing);
+                mediaSession.setPlaying(playing);
             }
         });
+    }
+
+    private void nowPlaying(String title, String artist, String album, long durationMs, byte[] art, int width, int height) {
+        runOnUiThread(() -> {
+            if (mediaSession != null) {
+                mediaSession.setMetadata(title, artist, album, durationMs, art, width, height);
+            }
+        });
+    }
+
+    private float volume() {
+        AudioManager audio = getSystemService(AudioManager.class);
+        int max = audio == null ? 0 : audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        return max > 0 ? (float) audio.getStreamVolume(AudioManager.STREAM_MUSIC) / max : -1f;
+    }
+
+    private void setVolume(float level) {
+        AudioManager audio = getSystemService(AudioManager.class);
+        if (audio != null) {
+            int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(level * max), 0);
+        }
     }
 
     @Override
@@ -420,6 +444,7 @@ public class LiviActivity extends NativeActivity {
             return super.dispatchKeyEvent(event);
         }
         key(
+                event.getKeyCode(),
                 event.getScanCode(),
                 event.getUnicodeChar(),
                 action == KeyEvent.ACTION_DOWN,
