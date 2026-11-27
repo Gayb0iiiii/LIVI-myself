@@ -17,6 +17,8 @@ pub struct State {
     pub sessions: Sessions,
     pub now_playing: NowPlaying,
     #[serde(default)]
+    pub audio: Option<AudioStream>,
+    #[serde(default)]
     pub video_playback: Option<VideoPlayback>,
     pub navigation: Navigation,
     pub system: System,
@@ -41,6 +43,7 @@ impl State {
             "front" => self.front = read(value)?,
             "sessions" => self.sessions = read(value)?,
             "nowPlaying" => self.now_playing = read(value)?,
+            "audio" => self.audio = read(value)?,
             "videoPlayback" => self.video_playback = read(value)?,
             "navigation" => self.navigation = read(value)?,
             "system" => self.system = read(value)?,
@@ -220,6 +223,18 @@ pub struct Mfi {
     pub identity: bool,
     pub generation: Option<u8>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub probed: bool,
+    #[serde(default)]
+    pub chip: Option<MfiChip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfiChip {
+    pub bus: u32,
+    pub address: u16,
+    pub generation: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -271,10 +286,20 @@ pub struct System {
     pub wifi_countries: Vec<String>,
     pub displays: Vec<Display>,
     pub displays_settable: bool,
+    pub mfi_on_board: bool,
     pub audio_sinks: Vec<AudioDevice>,
     pub audio_sources: Vec<AudioDevice>,
     pub start_page: String,
     pub fonts: Vec<String>,
+    pub utc_offset_minutes: Option<i32>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub display_off: bool,
+    #[serde(default)]
+    pub screen_mm: Option<(u32, u32)>,
+    #[serde(default)]
+    pub apply_pending: bool,
 }
 
 /// Host measurements. Missing or unsupported readings stay null, never zero.
@@ -416,6 +441,20 @@ pub struct NowPlaying {
     pub artwork: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioStream {
+    pub codec: String,
+    pub rate: u32,
+    pub bits: u8,
+    pub channels: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffered: Option<bool>,
+    pub buffer_ms: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_ms: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoPlayback {
@@ -468,6 +507,8 @@ pub struct Display {
     pub panel: String,
     pub screen: Option<Screen>,
     pub current: Option<String>,
+    #[serde(default)]
+    pub panel_default: Option<String>,
     pub modes: Vec<String>,
     pub touch: Vec<String>,
 }

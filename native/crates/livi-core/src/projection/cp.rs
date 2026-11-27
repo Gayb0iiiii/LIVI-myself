@@ -17,6 +17,7 @@ impl Projection {
                     ..Default::default()
                 };
                 let index = self.upsert(Link::Cp(id), transport(wired), &ids);
+                self.note_controller(id);
                 self.auto_activate(index);
                 if let Some(layout) = self.phone_layout() {
                     self.cp.stack(id, StackCmd::ClusterLayout(layout));
@@ -84,6 +85,11 @@ impl Projection {
             CpEvent::HelperConnected => {
                 let targets = self.targets();
                 self.devices.page(targets, true);
+                let chip = livi_core_proto::helper::read_mfi_chip(&self.mfi_chip);
+                self.hub.update(|s| {
+                    s.mfi.probed = chip.is_some();
+                    s.mfi.chip = chip.flatten();
+                });
             }
             CpEvent::HostUiRequested { id } => {
                 println!("[core] CarPlay asks for the car's own UI");
@@ -146,14 +152,29 @@ impl Projection {
                 }
             }
             CpEvent::Radio { command, .. } => {
-                if let (Some(radio), Some(ask)) = (&self.radio, crate::cp_radio::ask(command)) {
+                if let (Some(radio), Some(ask)) =
+                    (&self.radio, crate::projection::cp_radio::ask(command))
+                {
                     let _ = radio.send(ask);
                 }
             }
             CpEvent::VideoCodec { .. } => {}
             CpEvent::PhoneUtcOffset { minutes } => {
-                tokio::spawn(crate::gnss::timezone::apply_phone_offset(minutes));
+                if crate::gnss::timezone::settable() {
+                    tokio::spawn(crate::gnss::timezone::apply_phone_offset(minutes));
+                } else {
+                    self.hub
+                        .update(|s| s.system.utc_offset_minutes = Some(minutes));
+                }
             }
+        }
+    }
+
+    fn note_controller(&mut self, id: SessionId) {
+        if let Some(device) = self.by_link(Link::Cp(id)).map(|s| s.device.clone())
+            && self.devices.registry.note_controller(&device)
+        {
+            self.publish();
         }
     }
 
@@ -197,6 +218,7 @@ impl Projection {
                     self.changed();
                 }
                 let index = self.upsert(Link::Cp(id), transport(wired), &ids);
+                self.note_controller(id);
                 self.auto_activate(index);
             }
             Presence::Active { .. } => {

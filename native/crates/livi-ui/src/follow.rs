@@ -29,7 +29,8 @@ pub enum Update {
     Settings,
     Spectrum(Vec<f32>),
     Open(String),
-    Volume(f64),
+    Key(String),
+    Volume(livi_ui_model::overlay::Level),
     PhoneName(String),
     Camera(bool),
     MainMask(Option<Mask>),
@@ -38,6 +39,7 @@ pub enum Update {
     Video(Option<VideoPlayback>),
     Mirrored(bool),
     Held(bool),
+    ScreenMm(Option<(u32, u32)>),
 }
 
 #[derive(Default)]
@@ -61,6 +63,7 @@ pub struct Follow {
     video: Option<Option<VideoPlayback>>,
     mirrored: Option<bool>,
     held: Option<bool>,
+    screen_mm: Option<Option<(u32, u32)>>,
 }
 
 impl Follow {
@@ -194,10 +197,16 @@ impl Follow {
             }
         }
         if hit("system") {
+            crate::clock::set_offset(state.system.utc_offset_minutes);
             let fonts = state.system.fonts.clone();
             if self.fonts.as_ref() != Some(&fonts) {
                 self.fonts = Some(fonts.clone());
                 out.push(Update::Fonts(fonts));
+            }
+            let mm = state.system.screen_mm;
+            if self.screen_mm != Some(mm) {
+                self.screen_mm = Some(mm);
+                out.push(Update::ScreenMm(mm));
             }
         }
         if hit("cameras") {
@@ -210,7 +219,7 @@ impl Follow {
         {
             out.push(Update::Settings);
         }
-        if hit("config")
+        if (hit("config") || hit("system"))
             && let Some(level) = self.volume.update(state)
         {
             out.push(Update::Volume(level));

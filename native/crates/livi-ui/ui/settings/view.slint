@@ -10,6 +10,7 @@ import { RowButton } from "actions.slint";
 import { SelectBody, NumberBody, TextBody, ColorBody, SliderBody, PendingBody, PickData, CalibrationBody, KnobData } from "fields.slint";
 import { Focus, FocusZone } from "../focus.slint";
 import { SliderGrab } from "controls.slint";
+import { Keyboard, KeyboardMode, KeyboardPanel } from "../keyboard.slint";
 
 export { RowData, RowKind, PickData, KnobData }
 
@@ -23,7 +24,6 @@ export global SettingsState {
     in property <string> apply-text: "Apply";
     in property <[RowData]> rows;
     in property <[PickData]> picks;
-    in property <bool> read-only;
     in property <float> number-value;
     in property <float> number-min;
     in property <float> number-max;
@@ -93,8 +93,22 @@ export component SettingsView inherits Rectangle {
 
     property <int> focus-index: Focus.zone == FocusZone.main ? Focus.main-index : -1;
     property <length> lead: Metrics.header-h + Metrics.header-mb;
+    property <bool> typing: Focus.editing && ((SettingsState.kind == ScreenKind.text && Focus.main(SettingsState.focus-base)) || (SettingsState.kind == ScreenKind.number && Focus.main(SettingsState.focus-base + 1)) || (SettingsState.kind == ScreenKind.color && Focus.main(SettingsState.focus-base)));
+    property <bool> keyboard-shown: Keyboard.available && root.typing;
+    property <KeyboardMode> keyboard-mode: SettingsState.kind == ScreenKind.number ? KeyboardMode.number : SettingsState.kind == ScreenKind.color ? KeyboardMode.hex : KeyboardMode.text;
+
+    changed keyboard-shown => {
+        if (root.keyboard-shown) {
+            Keyboard.open(root.keyboard-mode);
+        } else {
+            Keyboard.close();
+        }
+    }
 
     changed focus-index => {
+        if (focus-index < 0) {
+            return;
+        }
         if (focus-index < SettingsState.focus-base) {
             flick.content-y = 0;
             return;
@@ -175,6 +189,7 @@ export component SettingsView inherits Rectangle {
                                 width: parent.width;
                                 height: parent.height;
                                 data: r;
+                                on-paper: true;
                                 focused: r.tool-offset != 0 && r.focus-at >= 0 && parent.rel == 0;
                                 capture => { SettingsState.capture(i); }
                                 focus-tool: r.tool-offset >= 0 && r.focus-at >= 0 && parent.rel >= r.tool-offset && parent.rel - r.tool-offset < r.tools.length ? parent.rel - r.tool-offset : -1;
@@ -193,7 +208,6 @@ export component SettingsView inherits Rectangle {
                     if SettingsState.kind == ScreenKind.select: SelectBody {
                         base: SettingsState.focus-base;
                         picks: SettingsState.picks;
-                        read-only: SettingsState.read-only;
                         pick(i) => { SettingsState.pick(i); }
                     }
                     if SettingsState.kind == ScreenKind.number: NumberBody {
@@ -210,6 +224,7 @@ export component SettingsView inherits Rectangle {
                         commit(s) => { SettingsState.number-commit(s); }
                     }
                     if SettingsState.kind == ScreenKind.text: TextBody {
+                        base: SettingsState.focus-base;
                         focused: Focus.main(SettingsState.focus-base);
                         editing: Focus.editing && Focus.main(SettingsState.focus-base);
                         value: SettingsState.text-value;
@@ -260,6 +275,7 @@ export component SettingsView inherits Rectangle {
                 }
             }
         }
+        if root.keyboard-shown: KeyboardPanel {}
     }
 
     if SettingsState.dialog-open: Rectangle {

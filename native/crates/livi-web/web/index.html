@@ -36,6 +36,9 @@
   .flash-row:last-child { border-bottom: 0; }
   .flash-row .slot { font-family: ui-monospace, monospace; color: var(--acc); }
   .flash-row .name { color: var(--dim); font-size: 12px; }
+  @media (max-width: 560px) {
+    .flash-row .row { grid-column: 1 / -1; flex-wrap: wrap; justify-content: flex-end; }
+  }
   .msg { margin-top: 10px; font-family: ui-monospace, monospace; font-size: 12px; min-height: 1.4em; }
   .msg.ok { color: var(--ok); }
   .msg.err { color: var(--warn); }
@@ -61,7 +64,8 @@
       <dt>Firmware</dt><dd id="firmware">loading…</dd>
       <dt>Kernel</dt><dd id="kernel">loading…</dd>
       <dt>Uptime</dt><dd id="uptime">loading…</dd>
-      <dt>Load</dt><dd id="load">loading…</dd>
+      <dt>CPU</dt><dd id="cpu">loading…</dd>
+      <dt>Load (1/5/15 min)</dt><dd id="load">loading…</dd>
       <dt>Memory</dt><dd id="mem">loading…</dd>
       <dt>USB0 MAC</dt><dd id="mac">loading…</dd>
       <dt>CP</dt><dd id="cp">loading…</dd>
@@ -131,7 +135,7 @@
 
   <h2>Actions</h2>
   <div class="card row" style="justify-content:flex-end">
-    <button id="reboot" class="danger">Reboot dongle</button>
+    <button id="reboot" class="danger">Reboot</button>
   </div>
 </main>
 <script>
@@ -173,7 +177,7 @@ async function tick() {
     const r = await fetch('/api/status');
     if (r.ok) {
       const s = await r.json();
-      for (const k of ['model','kernel','uptime','load','mem','mac','cp']) document.getElementById(k).textContent = s[k];
+      for (const k of ['model','kernel','uptime','cpu','load','mem','mac','cp']) document.getElementById(k).textContent = s[k] || '—';
       document.getElementById('firmware').textContent = `${s.version} (${s.build})`;
       installed = { target: s.target, version: s.version, build: s.build };
     }
@@ -220,11 +224,12 @@ const ledBriV  = document.getElementById('led-brightness-val');
 const ledMsg = document.getElementById('status-msg');
 
 // Which sections this dongle offers. flash.mtd: it takes a .lfwb bundle.
-let CAPS = { flash: {}, led: false };
+let CAPS = { flash: {}, led: false, switches: true };
 (async () => {
   try {
     CAPS = await (await fetch('/api/caps')).json();
     if (CAPS.led) document.getElementById('sec-led').hidden = false;
+    if (CAPS.switches === false) document.querySelectorAll('label.switch').forEach(s => { s.hidden = true; });
     if ((CAPS.flash || {}).mtd) {
       document.getElementById('sec-flash').hidden = false;
       document.getElementById('flash-slot').textContent = '.lfwb';
@@ -281,11 +286,24 @@ const bar = document.getElementById('status-progress');
 function fmtKB(n) { return (n/1024).toFixed(0) + ' KiB'; }
 
 async function flashFile(file) {
+  say('Freeing memory for the update…');
+  const resume = () => fetch('/api/flash/resume', { method: 'POST' }).catch(() => {});
+  try {
+    const p = await (await fetch('/api/flash/prepare', { method: 'POST' })).json();
+    if (!p.ok) { say(p.error || 'could not free memory', 'err'); resume(); return; }
+    if ((await (await fetch('/api/flash/room')).json()).room === false) {
+      resume();
+      say('Not enough memory, please reboot and flash before starting a session.', 'err');
+      return;
+    }
+  } catch { resume(); say('network error before the upload', 'err'); return; }
   say(`Uploading ${fmtKB(file.size)}…`);
   bar.hidden = false; bar.value = 0;
 
   const xhr = new XMLHttpRequest();
   let writePoll = null;
+  let rebooting = false;
+  const stopPoll = () => { if (writePoll) { clearInterval(writePoll); writePoll = null; } };
   xhr.upload.addEventListener('progress', e => {
     if (e.lengthComputable) {
       const pct = (e.loaded / e.total) * 100;
@@ -324,6 +342,7 @@ async function flashFile(file) {
           lastPhaseKey = key; phaseAt = now;
         }
       } else if (j.phase === 'done') {
+        rebooting = true;
         say(`Rebooting…`, 'ok');
       } else if (j.phase === 'error') {
         say(`${short} flash error`, 'err');
@@ -332,7 +351,7 @@ async function flashFile(file) {
     } catch {}
   }, 250);
   xhr.addEventListener('load', () => {
-    if (writePoll) { clearInterval(writePoll); writePoll = null; }
+    stopPoll();
     bar.hidden = true;
     try {
       const j = JSON.parse(xhr.responseText);
@@ -340,8 +359,15 @@ async function flashFile(file) {
       else      say(j.error || 'flash failed', 'err');
     } catch { say('server returned non-JSON: ' + xhr.responseText.slice(0, 200), 'err'); }
   });
-  xhr.addEventListener('error', () => { bar.hidden = true; say('network error during upload', 'err'); });
-  xhr.addEventListener('abort', () => { bar.hidden = true; say('upload aborted', 'err'); });
+  // A board that wrote everything reboots before it answers, the lost connection is that reboot.
+  xhr.addEventListener('error', () => {
+    stopPoll();
+    bar.hidden = true;
+    if (rebooting) return;
+    resume();
+    say('network error during upload', 'err');
+  });
+  xhr.addEventListener('abort', () => { stopPoll(); bar.hidden = true; resume(); say('upload aborted', 'err'); });
   // The bundle carries a CRC per image, the dongle checks them before it writes anything.
   xhr.open('POST', '/api/flash');
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -352,7 +378,7 @@ document.querySelectorAll('input[type=file]').forEach(inp => {
   inp.addEventListener('change', async () => {
     const file = inp.files[0]; if (!file) return;
     inp.value = '';
-    if (!confirm(`Flash ${fmtKB(file.size)}? The dongle will restart or reboot.`)) return;
+    if (!confirm(`Flash ${fmtKB(file.size)}? It will restart or reboot.`)) return;
     await flashFile(file);
   });
 });
@@ -405,11 +431,11 @@ document.getElementById('ota-check').addEventListener('click', async () => {
   offered = null; otaInstall.hidden = true;
   otaState.textContent = 'checking…';
   try {
-    if (!installed) throw new Error('the dongle has not reported its firmware yet');
+    if (!installed) throw new Error('no firmware reported yet');
     const rel = await otaRelease();
     const base = `${OTA_FIRMWARE}/${rel.ref}/${installed.target}`;
     const r = await fetch(`${base}/firmware.json`, { cache: 'no-store' });
-    if (r.status === 404) throw new Error(`${rel.name} carries no firmware for this dongle`);
+    if (r.status === 404) throw new Error(`${rel.name} carries no firmware for this target`);
     if (!r.ok) throw new Error(`firmware.json: ${r.status}`);
     const fw = await r.json();
     if (fw.build === installed.build) {
@@ -429,7 +455,7 @@ document.getElementById('ota-check').addEventListener('click', async () => {
 otaInstall.addEventListener('click', async () => {
   if (!offered) return;
   const fw = offered;
-  if (!confirm(`${fw.downgrade ? 'Downgrade to' : 'Update to'} ${fw.version} (${fw.build})? The dongle will restart or reboot.`)) return;
+  if (!confirm(`${fw.downgrade ? 'Downgrade to' : 'Update to'} ${fw.version} (${fw.build})? It will restart or reboot.`)) return;
   otaInstall.disabled = true;
   try {
     say(`Downloading ${fmtKB(fw.size)}…`);
@@ -452,7 +478,7 @@ otaInstall.addEventListener('click', async () => {
 });
 
 document.getElementById('reboot').addEventListener('click', async () => {
-  if (!confirm('Reboot dongle now?')) return;
+  if (!confirm('Reboot now?')) return;
   try {
     await fetch('/api/reboot', { method: 'POST' });
     say('reboot requested — device will be back in ~5 s', 'ok');

@@ -40,6 +40,15 @@ fn auto_connector_option() -> Choice {
     )
 }
 
+fn rotations() -> Vec<Choice> {
+    vec![
+        number_choice("0°", 0.0),
+        number_choice("90°", 90.0),
+        number_choice("180°", 180.0),
+        number_choice("270°", 270.0),
+    ]
+}
+
 fn touch_page(screen: Screen) -> Node {
     Node::route(
         "touch",
@@ -51,14 +60,26 @@ fn touch_page(screen: Screen) -> Node {
         )],
     )
     .icon("touch")
-    .disabled(Condition::DisplaysNotSettable)
+    .hidden(Condition::DisplaysNotSettable)
 }
 
 fn display_rows(screen: Screen) -> Vec<Node> {
-    let (connector_path, mode_path) = match screen {
-        Screen::Main => ("displayConnector.main", "displayMode.main"),
-        Screen::Cluster => ("displayConnector.cluster", "displayMode.cluster"),
-        Screen::Aux => ("displayConnector.aux", "displayMode.aux"),
+    let (connector_path, mode_path, rotation_path) = match screen {
+        Screen::Main => (
+            "displayConnector.main",
+            "displayMode.main",
+            "displayRotation.main",
+        ),
+        Screen::Cluster => (
+            "displayConnector.cluster",
+            "displayMode.cluster",
+            "displayRotation.cluster",
+        ),
+        Screen::Aux => (
+            "displayConnector.aux",
+            "displayMode.aux",
+            "displayRotation.aux",
+        ),
     };
     vec![
         Node::select(
@@ -69,7 +90,7 @@ fn display_rows(screen: Screen) -> Vec<Node> {
         .icon("displayConnector")
         .display_value()
         .options_from(OptionSource::Connectors)
-        .read_only(Condition::DisplaysNotSettable)
+        .hidden(Condition::DisplaysNotSettable)
         .page(Label::new("settings.displayConnector", "Connector")),
         Node::select(
             Label::new("settings.displayMode", "Display Mode"),
@@ -79,8 +100,17 @@ fn display_rows(screen: Screen) -> Vec<Node> {
         .icon("displayMode")
         .display_value()
         .options_from(OptionSource::DisplayModes(screen))
-        .read_only(Condition::DisplaysNotSettable)
+        .hidden(Condition::DisplaysNotSettable)
         .page(Label::new("settings.displayMode", "Display Mode")),
+        Node::select(
+            Label::new("settings.cameraRotation", "Rotation"),
+            rotation_path,
+            rotations(),
+        )
+        .icon("displayRotation")
+        .display_value()
+        .hidden(Condition::DisplaysNotSettable)
+        .page(Label::new("settings.cameraRotation", "Rotation")),
     ]
 }
 
@@ -95,7 +125,7 @@ fn screen_size(
 ) -> Node {
     Node::number(Label::new(key, text), path)
         .icon(icon)
-        .disabled(Condition::DisplaysSettable)
+        .hidden(Condition::DisplaysSettable)
         .range(Some(min), Some(max), Some(1.0))
         .display_value()
         .page(Label::new(key, title))
@@ -127,7 +157,7 @@ fn window_size_page(width: Node, height: Node) -> Node {
         vec![width, height],
     )
     .icon("windowSize")
-    .disabled(Condition::DisplaysSettable)
+    .hidden(Condition::DisplaysSettable)
 }
 
 fn view_area_page(screen: Screen) -> Node {
@@ -165,10 +195,13 @@ fn fullscreen(path: &'static str) -> Node {
 
 fn screens(main: &'static str, cluster: &'static str, aux: &'static str) -> Vec<Node> {
     vec![
-        Node::checkbox(Label::new("settings.mainScreen", "Main"), main).icon("mainScreen"),
-        Node::checkbox(Label::new("settings.clusterScreen", "Cluster"), cluster)
-            .icon("clusterScreen"),
-        Node::checkbox(Label::new("settings.auxScreen", "Aux"), aux).icon("auxScreen"),
+        Node::checkbox(Label::new("settings.mainScreen", "Main Screen"), main).icon("mainScreen"),
+        Node::checkbox(
+            Label::new("settings.clusterScreen", "Cluster Screen"),
+            cluster,
+        )
+        .icon("clusterScreen"),
+        Node::checkbox(Label::new("settings.auxScreen", "Aux Screen"), aux).icon("auxScreen"),
     ]
 }
 
@@ -258,7 +291,7 @@ fn connections() -> Node {
                         "wifiDedicatedInterface",
                     )
                     .icon("dedicatedInterface")
-                    .disabled(Condition::NotLinux),
+                    .hidden(Condition::NotLinux),
                     Node::custom(
                         Label::new("settings.wifiLinkSpeed", "Link Speed"),
                         "wifiInterface",
@@ -477,23 +510,18 @@ fn tab_settings() -> Node {
                     screens("camera.main", "camera.cluster", "camera.aux"),
                     vec![
                         Node::checkbox(
-                            Label::new("settings.cameraMirror", "Mirror"),
+                            Label::new("settings.cameraMirror", "Mirroring"),
                             "cameraMirror",
                         )
                         .icon("cameraMirror"),
                         Node::select(
                             Label::new("settings.cameraRotation", "Rotation"),
                             "cameraRotation",
-                            vec![
-                                number_choice("0°", 0.0),
-                                number_choice("90°", 90.0),
-                                number_choice("180°", 180.0),
-                                number_choice("270°", 270.0),
-                            ],
+                            rotations(),
                         )
                         .icon("cameraRotation")
                         .display_value()
-                        .page(Label::new("settings.cameraRotation", "Camera Rotation")),
+                        .page(Label::new("settings.cameraRotation", "Rotation")),
                         Node::select(Label::new("settings.camera", "Camera"), "cameraId", vec![])
                             .icon("camera")
                             .display_value()
@@ -530,6 +558,8 @@ fn key_bindings() -> Node {
             binding("settings.cycleSession", "Cycle Session", "cycleSession"),
             binding("settings.clusterLayout", "Cluster Layout", "clusterLayout"),
             binding("settings.clusterView", "Cluster View", "clusterContent"),
+            binding("settings.zoomIn", "Map Zoom In", "zoomIn"),
+            binding("settings.zoomOut", "Map Zoom Out", "zoomOut"),
             binding("settings.playPause", "Play/Pause", "playPause"),
             binding("settings.play", "Play", "play"),
             binding("settings.pause", "Pause", "pause"),
@@ -574,12 +604,6 @@ fn mfi() -> Node {
         "mfi",
         Label::new("settings.mfi", "MFi"),
         vec![
-            Node::number(Label::new("settings.i2cBus", "I2C Bus"), "carPlayMfiI2cBus")
-                .icon("i2cBus")
-                .range(Some(0.0), Some(20.0), Some(1.0))
-                .default_number(2.0)
-                .display_value()
-                .page(Label::new("settings.i2cBus", "I2C Bus")),
             Node::number(
                 Label::new("settings.mfiPowerGpio", "Power Pin"),
                 "carPlayMfiPowerGpio",
@@ -589,6 +613,7 @@ fn mfi() -> Node {
             .default_number(-1.0)
             .display_value()
             .shown(Shown::DashIfNegative)
+            .hidden(Condition::MfiOnBoard)
             .page(Label::new("settings.mfiPowerGpio", "Power Pin")),
             Node::route(
                 "mfi-certificate",
@@ -718,7 +743,7 @@ pub fn schema() -> Node {
             .icon("fftDelay")
             .display_value()
             .shown(Shown::Suffix(" ms"))
-            .page(Label::new("settings.fftDelay", "FFT Visualization Delay")),
+            .page(Label::new("settings.fftDelay", "FFT Delay")),
             Node::number(Label::new("settings.uiZoom", "UI Zoom"), "uiZoomPercent")
                 .icon("uiZoom")
                 .display_value()

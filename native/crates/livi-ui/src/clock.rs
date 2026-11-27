@@ -2,10 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
+use std::sync::Mutex;
+
+static OFFSET: Mutex<Option<i32>> = Mutex::new(None);
+
+pub fn set_offset(minutes: Option<i32>) {
+    *OFFSET.lock().unwrap_or_else(|e| e.into_inner()) = minutes;
+}
+
 pub fn now_text() -> String {
+    // SAFETY: time accepts a null output pointer.
     let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let offset = *OFFSET.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: an all-zero tm is valid, localtime_r and gmtime_r only write into it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe { libc::localtime_r(&now, &mut tm) };
+    match offset {
+        // SAFETY: both pointers are valid for the call.
+        Some(minutes) => unsafe {
+            libc::gmtime_r(&now.wrapping_add((minutes * 60).into()), &mut tm);
+        },
+        // SAFETY: both pointers are valid for the call.
+        None => unsafe {
+            libc::localtime_r(&now, &mut tm);
+        },
+    }
     let sep = if tm.tm_sec % 2 == 0 { ':' } else { ' ' };
     format!("{:02}{sep}{:02}", tm.tm_hour, tm.tm_min)
 }
@@ -15,9 +35,12 @@ pub fn stamp() -> String {
         tv_sec: 0,
         tv_usec: 0,
     };
+    // SAFETY: tv is a valid timeval, the timezone argument may be null.
     unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
     let now = tv.tv_sec;
+    // SAFETY: an all-zero tm is valid, localtime_r only writes into it.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call.
     unsafe { libc::localtime_r(&now, &mut tm) };
     format!(
         "{:02}:{:02}:{:02}.{:03}",

@@ -39,7 +39,7 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Point, SERIAL_COUNTER, Scale, Size, Transform};
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke};
 
-use livi_host_proto::ctrl::TouchCal;
+use livi_output_proto::ctrl::TouchCal;
 
 use crate::render::LiviElement;
 use crate::state::LiviState;
@@ -65,6 +65,7 @@ pub struct DrmState {
     outputs: Vec<Output>,
     wanted: BTreeSet<usize>,
     mode_settings: HashMap<usize, Option<String>>,
+    rotation_settings: HashMap<usize, u16>,
     touch_outputs: HashMap<String, String>,
     touch_devices: Vec<smithay::reexports::input::Device>,
     touch_cal: HashMap<String, TouchCal>,
@@ -92,6 +93,7 @@ struct Connector {
     panel_mm: Option<(i32, i32)>,
     transform: Transform,
     crtcs: Vec<crtc::Handle>,
+    lit: Option<(crtc::Handle, Mode)>,
 }
 
 struct Output {
@@ -160,7 +162,9 @@ fn start(
     let (device, notifier, fd) = open_device(&mut session, &seat)?;
 
     let gbm = GbmDevice::new(fd.clone())?;
+    // SAFETY: no other code in this process creates EGL displays, smithay tracks this one.
     let egl_display = unsafe { EGLDisplay::new(gbm.clone())? };
+    // SAFETY: the context was just created here and is current on no other thread.
     let renderer = unsafe { GlesRenderer::new(EGLContext::new(&egl_display)?)? };
     let formats = renderer.egl_context().dmabuf_render_formats().clone();
     let scanout = fd.dev_id().ok().map(|dev| (dev, plane_formats(&device)));
@@ -216,6 +220,7 @@ fn start(
         outputs: Vec::new(),
         wanted: BTreeSet::from([0]),
         mode_settings: HashMap::new(),
+        rotation_settings: HashMap::new(),
         touch_outputs: HashMap::new(),
         touch_devices: Vec::new(),
         touch_cal: HashMap::new(),
@@ -230,6 +235,7 @@ fn open_device(
     session: &mut LibSeatSession,
     seat: &str,
 ) -> Result<(DrmDevice, DrmDeviceNotifier, DrmDeviceFd), Box<dyn std::error::Error>> {
+    let mut waiting = None;
     for path in udev::all_gpus(seat)? {
         let flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
         let fd = match session.open(&path, flags) {
@@ -239,19 +245,25 @@ fn open_device(
                 continue;
             }
         };
-        let (device, notifier) = match DrmDevice::new(fd.clone(), true) {
+        let (device, notifier) = match DrmDevice::new(fd.clone(), false) {
             Ok(opened) => opened,
             Err(e) => {
                 log::info!("{} drives no display: {e}", path.display());
                 continue;
             }
         };
-        if connectors(&device, false).iter().any(|c| c.connected) {
+        let found = connectors(&device, false);
+        if found.iter().any(|c| c.connected) {
             log::info!("displays on {}", path.display());
             return Ok((device, notifier, fd));
         }
+        if waiting.is_none() && !found.is_empty() {
+            waiting = Some((path, device, notifier, fd));
+        }
     }
-    Err("no connected display".into())
+    let (path, device, notifier, fd) = waiting.ok_or("no display connector")?;
+    log::info!("no display connected yet, waiting on {}", path.display());
+    Ok((device, notifier, fd))
 }
 
 fn plane_formats(device: &DrmDevice) -> FormatSet {
@@ -282,6 +294,10 @@ fn connectors(device: &DrmDevice, probe: bool) -> Vec<Connector> {
                 .filter_map(|&e| device.get_encoder(e).ok())
                 .flat_map(|e| resources.filter_crtcs(e.possible_crtcs()))
                 .collect();
+            let lit = info
+                .current_encoder()
+                .and_then(|e| device.get_encoder(e).ok()?.crtc())
+                .and_then(|c| Some((c, device.get_crtc(c).ok()?.mode()?)));
             let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
             let edid = property(device, handle, "EDID")
                 .and_then(|(_, blob)| device.get_property_blob(blob).ok());
@@ -301,6 +317,7 @@ fn connectors(device: &DrmDevice, probe: bool) -> Vec<Connector> {
                     .or_else(|| edid.as_deref().and_then(timing_mm)),
                 transform: orientation(device, handle),
                 crtcs,
+                lit,
                 name,
             })
         })
@@ -419,6 +436,49 @@ pub fn set_mode(state: &mut LiviState, screen_idx: usize, setting: Option<String
     }
 }
 
+fn rotation_setting(state: &LiviState, screen_idx: usize) -> u16 {
+    state
+        .drm
+        .as_ref()
+        .and_then(|d| d.rotation_settings.get(&screen_idx).copied())
+        .or_else(|| role_env(state, screen_idx, "ROTATION")?.parse().ok())
+        .unwrap_or(0)
+}
+
+fn turned(panel: Transform, degrees: u16) -> Transform {
+    let quarters = match panel {
+        Transform::_90 => 1,
+        Transform::_180 => 2,
+        Transform::_270 => 3,
+        _ => 0,
+    };
+    match (quarters + degrees / 90) % 4 {
+        1 => Transform::_90,
+        2 => Transform::_180,
+        3 => Transform::_270,
+        _ => Transform::Normal,
+    }
+}
+
+pub fn set_rotation(state: &mut LiviState, screen_idx: usize, degrees: u16) {
+    let Some(drm) = state.drm.as_mut() else {
+        return;
+    };
+    drm.rotation_settings.insert(screen_idx, degrees);
+    let stale = drm.outputs.iter().position(|o| {
+        o.screen_idx == screen_idx
+            && drm
+                .connectors
+                .iter()
+                .find(|c| c.name == o.connector)
+                .is_some_and(|c| turned(c.transform, degrees) != o.transform)
+    });
+    if let Some(pos) = stale {
+        drm.outputs.remove(pos);
+        arrange(state);
+    }
+}
+
 fn assign(wanted: &[(usize, Option<String>)], connected: &[String]) -> Vec<(usize, String)> {
     let is_free = |taken: &[(usize, String)], name: &str| !taken.iter().any(|(_, t)| t == name);
     let mut taken: Vec<(usize, String)> = Vec::new();
@@ -515,11 +575,29 @@ fn arrange(state: &mut LiviState) {
             Err(e) => log::error!("{name} for screen {screen_idx} did not light up: {e}"),
         }
     }
+    if let Some(drm) = state.drm.as_mut() {
+        dark_unused(drm);
+    }
     if changed {
         crate::ctrl::send_displays(state);
         crate::ctrl::send_panels(state);
     }
     apply_calibration(state);
+}
+
+fn dark_unused(drm: &mut DrmState) {
+    for connector in &mut drm.connectors {
+        let Some((crtc, _)) = connector.lit else {
+            continue;
+        };
+        if drm.outputs.iter().any(|o| o.crtc == crtc) {
+            continue;
+        }
+        connector.lit = None;
+        if let Err(e) = drm.device.set_crtc(crtc, None, (0, 0), &[], None) {
+            log::warn!("{} stays lit: {e}", connector.name);
+        }
+    }
 }
 
 pub fn apply_calibration(state: &mut LiviState) {
@@ -557,20 +635,29 @@ fn light(
     name: &str,
     mode_setting: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let rotation = rotation_setting(state, screen_idx);
     let drm = state.drm.as_mut().ok_or("no display device")?;
     let connector = drm
         .connectors
         .iter()
         .find(|c| c.name == name)
         .ok_or("connector gone")?;
-    let mode = pick_mode(&connector.modes, mode_setting).ok_or("no mode")?;
+    let picked = pick_mode(&connector.modes, mode_setting).ok_or("no mode")?;
     let busy: Vec<crtc::Handle> = drm.outputs.iter().map(|o| o.crtc).collect();
-    let crtc = *connector
-        .crtcs
-        .iter()
-        .find(|c| !busy.contains(c))
-        .ok_or("no free crtc")?;
-    let (handle, transform) = (connector.handle, connector.transform);
+    let lit = connector.lit.filter(|(c, _)| !busy.contains(c));
+    let crtc = match lit {
+        Some((c, _)) => c,
+        None => *connector
+            .crtcs
+            .iter()
+            .find(|c| !busy.contains(c))
+            .ok_or("no free crtc")?,
+    };
+    let mode = match lit {
+        Some((_, m)) if m.size() == picked.size() && m.vrefresh() == picked.vrefresh() => m,
+        _ => picked,
+    };
+    let (handle, transform) = (connector.handle, turned(connector.transform, rotation));
     let surface = drm.device.create_surface(crtc, mode, &[handle])?;
     let allocator = GbmAllocator::new(
         drm.gbm.clone(),
@@ -649,6 +736,10 @@ pub fn displays_lines(state: &LiviState) -> Option<String> {
             };
             format!("{w}x{h}@{}{scan}", o.mode.vrefresh())
         });
+        let default = pick_mode(&c.modes, None).map_or("-".to_string(), |m| {
+            let (w, h) = m.size();
+            format!("{w}x{h}")
+        });
         let modes = sizes(&c.modes);
         let modes = if modes.is_empty() {
             "-".to_string()
@@ -656,7 +747,7 @@ pub fn displays_lines(state: &LiviState) -> Option<String> {
             modes.join(",")
         };
         out.push_str(&format!(
-            "display {} {role} {current} {modes} {} {}\n",
+            "display {} {role} {current} {default} {modes} {} {}\n",
             c.name, c.id, c.panel
         ));
     }

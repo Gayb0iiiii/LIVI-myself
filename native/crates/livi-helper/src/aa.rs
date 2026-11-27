@@ -7,19 +7,18 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(usb_host)]
 use livi_aa::usb::Control;
 use livi_aa::wpp;
 use livi_core_proto::aa_events::{AaHelperEvent, AaTransport};
 use livi_core_proto::helper::HelperSockets;
-use livi_runtime::aa_sock::{self, AaSockDeps};
-use livi_runtime::livi_sock::Broadcaster;
-use livi_runtime::sco::ScoSink;
-use livi_runtime::state::HelperState;
+use livi_helper_stack::aa_sock::{self, AaSockDeps};
+use livi_helper_stack::livi_sock::Broadcaster;
+use livi_helper_stack::sco::ScoSink;
+use livi_helper_stack::state::HelperState;
 use livi_wifi::{Channel, Security};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[cfg(not(target_os = "linux"))]
-const AP_WAIT: Duration = Duration::from_secs(15);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -51,9 +50,8 @@ impl WiredPhones {
     }
 }
 
-pub fn on_dongle(base: &AaConfig, passphrase: String) -> Told {
-    use livi_link_host::{ap, link};
-    let live = livi_link_host::on_air(link::CHOICE);
+pub fn on_dongle(base: &AaConfig, passphrase: String, wifi: &str) -> Told {
+    let live = livi_link_host::on_air(wifi);
     let told = AaConfig {
         ssid: live
             .as_ref()
@@ -61,57 +59,81 @@ pub fn on_dongle(base: &AaConfig, passphrase: String) -> Told {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| base.ssid.clone()),
         channel: live.as_ref().map_or(base.channel, |ap| ap.channel),
-        ap_ip: ip_facing_dongle().unwrap_or_else(|| base.ap_ip.clone()),
+        ap_ip: ap_ip(wifi).unwrap_or_else(|| base.ap_ip.clone()),
         passphrase,
         ..base.clone()
     };
     (
         told,
         live.map(|ap| ap.security).unwrap_or_default(),
-        ap::mac().unwrap_or_default(),
+        ap_mac(wifi).unwrap_or_default(),
     )
 }
 
-fn ip_facing_dongle() -> Option<String> {
+fn ap_mac(wifi: &str) -> Option<String> {
+    if wifi == livi_link_host::link::CHOICE {
+        livi_link_host::ap::mac()
+    } else {
+        livi_helper_stack::net::wlan_mac(wifi)
+    }
+}
+
+fn ap_ip(wifi: &str) -> Option<String> {
     #[cfg(target_os = "linux")]
-    let iface = livi_link_host::link::host_iface();
+    let iface = if wifi == livi_link_host::link::CHOICE {
+        livi_link_host::link::host_iface()
+    } else {
+        Some(wifi.to_string())
+    };
     #[cfg(not(target_os = "linux"))]
-    let iface =
-        livi_link_host::link::name().and_then(|name| livi_runtime::net::iface_facing(&name));
+    let iface = Some(crate::dongle::phones_iface(wifi)).filter(|i| !i.is_empty());
     iface
-        .and_then(|iface| livi_runtime::net::ipv4_of(&iface))
+        .and_then(|iface| livi_helper_stack::net::ipv4_of(&iface))
         .map(|a| a.to_string())
 }
 
-#[cfg(not(target_os = "linux"))]
 pub async fn watch_dongle(
     mut arrivals: tokio::sync::mpsc::UnboundedReceiver<crate::bt_dongle::Arrival>,
     cfg: AaConfig,
+    wifi: String,
     bcast: Broadcaster,
     wired: WiredPhones,
-    state: Arc<livi_runtime::state::HelperState>,
+    state: Arc<livi_helper_stack::state::HelperState>,
 ) {
     while let Some(arrival) = arrivals.recv().await {
-        let (cfg, bcast, wired, state) = (cfg.clone(), bcast.clone(), wired.clone(), state.clone());
+        let (cfg, wifi, bcast, wired, state) = (
+            cfg.clone(),
+            wifi.clone(),
+            bcast.clone(),
+            wired.clone(),
+            state.clone(),
+        );
         tokio::spawn(async move {
             let mac = arrival.peer;
-            println!("[aa] phone connected mac={mac} over the dongle");
-            let up = tokio::task::spawn_blocking(|| livi_link_host::ap::ready(AP_WAIT)).await;
+            println!("[aa] phone connected mac={mac} over bluetooth");
+            let ready = wifi.clone();
+            let up = tokio::task::spawn_blocking(move || {
+                crate::dongle::ap_ready(&ready, crate::dongle::AP_WAIT)
+            })
+            .await;
             if !up.unwrap_or(false) {
-                eprintln!("[aa] {mac}: the dongle's access point is not up");
+                eprintln!("[aa] {mac}: the access point is not up");
                 return;
             }
             let told =
-                tokio::task::spawn_blocking(move || on_dongle(&cfg, cfg.passphrase.clone())).await;
+                tokio::task::spawn_blocking(move || on_dongle(&cfg, cfg.passphrase.clone(), &wifi))
+                    .await;
             let Ok(told) = told else { return };
             bootstrap(arrival.stream, &mac, told, &bcast, &wired, &state).await;
         });
     }
 }
 
+#[cfg_attr(not(usb_host), allow(unused_variables))]
 pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcaster, WiredPhones) {
     let events = Broadcaster::default();
     let wired = WiredPhones::default();
+    #[cfg(usb_host)]
     let control = Control::default();
     let deps = AaSockDeps {
         set_wired_phones: Box::new({
@@ -120,10 +142,13 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
         }),
         events: events.clone(),
         set_sco_sink: Box::new(move |target| sco_sink.set(target)),
+        #[cfg(usb_host)]
         restart_usb: Box::new({
             let control = control.clone();
             move |serial| control.restart(serial)
         }),
+        #[cfg(not(usb_host))]
+        restart_usb: Box::new(|_| 0),
     };
     let path = sockets.android_auto.clone();
     tokio::spawn(async move {
@@ -131,6 +156,7 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
             eprintln!("[aa-sock] ended: {e}");
         }
     });
+    #[cfg(usb_host)]
     if usb {
         tokio::spawn(watch_usb(control, sockets.sessions.clone(), events.clone()));
         println!("[helper] Android Auto USB watcher started");
@@ -138,6 +164,7 @@ pub fn serve(sockets: &HelperSockets, sco_sink: ScoSink, usb: bool) -> (Broadcas
     (events, wired)
 }
 
+#[cfg(usb_host)]
 async fn watch_usb(control: Control, sessions: PathBuf, events: Broadcaster) {
     let subscribed = events.clone();
     livi_aa::usb::run(
@@ -292,6 +319,12 @@ fn emit_device(bcast: &Broadcaster, mac: &str, id: &wpp::Identity) {
         usb_serial: id.serial.clone(),
     };
     bcast.push_json(event.to_line());
+}
+
+pub fn serve_wifi(port: u16, sessions: PathBuf, events: Broadcaster) {
+    tokio::spawn(livi_aa::server::run(port, sessions, move |socket, peer| {
+        announce_session(&events, socket, peer, AaTransport::Wifi, None);
+    }));
 }
 
 pub fn announce_session(

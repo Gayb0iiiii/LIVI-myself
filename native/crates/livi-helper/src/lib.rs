@@ -3,23 +3,23 @@
 // Additional terms: see NOTICE
 
 pub mod aa;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "bluez"))]
 pub mod bluez;
-#[cfg(not(target_os = "linux"))]
 pub mod bt_dongle;
-#[cfg(not(target_os = "linux"))]
 pub mod dongle;
-pub mod embedded;
+pub mod in_process;
 pub mod link;
 pub mod mfi;
+#[cfg(feature = "uart-module")]
+pub mod uart_module;
 pub mod wired;
 #[cfg(target_os = "android")]
 pub mod wireless;
 
 use livi_core_proto::helper::HelperStart;
-use livi_runtime::bringup::CpConfig;
-use livi_runtime::ident::{Identity, Theme, Transport};
-use livi_runtime::vehicle::{Fuels, Plugs};
+use livi_helper_stack::bringup::CpConfig;
+use livi_helper_stack::ident::{Identity, Theme, Transport};
+use livi_helper_stack::vehicle::{Fuels, Plugs};
 use livi_wifi::{Band, Channel};
 
 pub const DEFAULT_NAME: &str = "LIVI";
@@ -27,6 +27,15 @@ pub const DEFAULT_PASSPHRASE: &str = "12345678";
 pub const DEFAULT_CHANNEL: u32 = 36;
 pub const SOURCE_VERSION: &str = "950.7.1";
 pub const AVAILABLE_CURRENT_MA: u16 = 500;
+
+#[cfg(target_os = "linux")]
+pub fn ap_iface(chosen: &str) -> String {
+    let iface = or(chosen, "wlan0");
+    if iface != livi_link_host::link::CHOICE {
+        return iface;
+    }
+    livi_link_host::link::host_iface().unwrap_or(iface)
+}
 
 pub fn or(value: &str, default: &str) -> String {
     if value.is_empty() {
@@ -77,8 +86,4 @@ pub fn carplay(start: &HelperStart, transport: Transport) -> (Identity, CpConfig
         theme,
     };
     (identity, cp)
-}
-
-pub(crate) fn short(serial: &str) -> &str {
-    &serial[..8.min(serial.len())]
 }

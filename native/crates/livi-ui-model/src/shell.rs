@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
+use livi_base::hex::rgb;
 use livi_core_proto::config::{Config, HandDriveType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,15 +28,6 @@ pub struct Look {
     pub language: String,
 }
 
-pub fn hex_color(text: &str) -> Option<[u8; 3]> {
-    let hex = text.trim().trim_start_matches('#');
-    if hex.len() != 6 {
-        return None;
-    }
-    let v = u32::from_str_radix(hex, 16).ok()?;
-    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
-}
-
 pub fn tabs(config: &Config) -> Vec<Tab> {
     let mut tabs = vec![Tab::Projection];
     if config.dashboard.main {
@@ -53,6 +45,17 @@ pub fn tabs(config: &Config) -> Vec<Tab> {
 
 pub const MIN_UI_HEIGHT: f32 = 292.0;
 
+pub const REFERENCE_PPI: f32 = 140.0;
+
+pub fn dpi_scale((w, h): (f32, f32), screen_mm: Option<(u32, u32)>) -> f32 {
+    let Some((w_mm, h_mm)) = screen_mm else {
+        return 1.0;
+    };
+    let inches = (w_mm as f32).hypot(h_mm as f32) / 25.4;
+    let ppi = w.hypot(h) / inches;
+    ((ppi / REFERENCE_PPI * 4.0).round() / 4.0).clamp(1.0, 3.0)
+}
+
 pub fn ui_scale(base: f32, zoom: f32, physical_height: f32) -> f32 {
     let height = physical_height / base.max(f32::EPSILON);
     let fit = if height > 0.0 {
@@ -68,7 +71,7 @@ pub fn look(config: &Config) -> Look {
     let pick = |on_dark: &Option<String>, on_light: &Option<String>| {
         if dark { on_dark } else { on_light }
             .as_deref()
-            .and_then(hex_color)
+            .and_then(rgb)
     };
     let positive = |v: u32, fallback: i32| if v > 0 { v as i32 } else { fallback };
     Look {
@@ -147,6 +150,5 @@ mod tests {
         assert_eq!(l.primary, Some([0, 0xad, 0xad]));
         assert_eq!(l.zoom, 2.0);
         assert!(l.right_hand);
-        assert_eq!(hex_color("nope"), None);
     }
 }

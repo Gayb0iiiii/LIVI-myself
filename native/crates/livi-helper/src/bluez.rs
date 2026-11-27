@@ -6,18 +6,17 @@ use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use livi_core_proto::aa_events::AaTransport;
 use livi_core_proto::helper::HelperSockets;
-use livi_runtime::bringup::CpConfig;
-use livi_runtime::bt;
-use livi_runtime::driver::spawn_link;
-use livi_runtime::ident::Identity;
-use livi_runtime::livi_sock::{Bluez, Broadcaster, run_bluetooth};
-use livi_runtime::mfi_async::SharedCoprocessor;
-use livi_runtime::net;
-use livi_runtime::reconnect;
-use livi_runtime::sco::ScoSink;
-use livi_runtime::state::HelperState;
+use livi_helper_stack::bringup::CpConfig;
+use livi_helper_stack::bt;
+use livi_helper_stack::driver::spawn_link;
+use livi_helper_stack::ident::Identity;
+use livi_helper_stack::livi_sock::{Bluez, Broadcaster, run_bluetooth};
+use livi_helper_stack::mfi_async::SharedCoprocessor;
+use livi_helper_stack::net;
+use livi_helper_stack::reconnect;
+use livi_helper_stack::sco::ScoSink;
+use livi_helper_stack::state::HelperState;
 use livi_wifi::Security;
 use tokio::sync::{mpsc, watch};
 
@@ -39,14 +38,6 @@ pub struct Bluetooth {
     pub aa_events: Broadcaster,
     pub wired_phones: WiredPhones,
     pub sco_sink: ScoSink,
-}
-
-pub fn ap_iface(chosen: &str) -> String {
-    let iface = crate::or(chosen, "wlan0");
-    if iface != livi_link_host::link::CHOICE {
-        return iface;
-    }
-    livi_link_host::link::host_iface().unwrap_or(iface)
 }
 
 pub fn session_cp(cp: &CpConfig, dongle_ap: bool) -> CpConfig {
@@ -101,7 +92,8 @@ async fn adapter(chosen: &str) -> String {
 pub async fn serve(b: Bluetooth, mut stop: watch::Receiver<bool>) -> Result<(), Box<dyn Error>> {
     let wireless = b.wireless;
     let adapter = adapter(&b.adapter).await;
-    let _ = tokio::task::spawn_blocking(move || livi_runtime::bluetoothd::setup(wireless)).await;
+    let _ =
+        tokio::task::spawn_blocking(move || livi_helper_stack::bluetoothd::setup(wireless)).await;
     println!(
         "[helper] starting BlueZ profile on {adapter} (wireless CarPlay {}, wireless Android Auto {})",
         if wireless.carplay { "on" } else { "off" },
@@ -111,7 +103,7 @@ pub async fn serve(b: Bluetooth, mut stop: watch::Receiver<bool>) -> Result<(), 
     let bt_mac = bt::adapter_address(&conn, &adapter).await?;
     println!(
         "[helper] adapter {} up (RFCOMM ch {})",
-        format_mac(&bt_mac),
+        livi_base::hex::mac(&bt_mac),
         bt::IAP_CHANNEL
     );
     let identity = Identity {
@@ -133,26 +125,23 @@ pub async fn serve(b: Bluetooth, mut stop: watch::Receiver<bool>) -> Result<(), 
         b.state.clone(),
     ));
 
-    let hfp = livi_runtime::hfp::Hfp::default();
+    let hfp = livi_helper_stack::hfp::Hfp::default();
     hfp.set_events(b.aa_events.clone());
     if let Err(e) = bt::start_hfp(&conn, &adapter, hfp).await {
         eprintln!("[hfp] profile registration failed: {e}");
     }
-    livi_runtime::sco::serve(
+    livi_helper_stack::sco::serve(
         b.sockets.sco_mic.clone(),
         b.aa_events.clone(),
         b.sco_sink.clone(),
     );
 
     if wireless.android_auto {
-        let events = b.aa_events.clone();
-        tokio::spawn(livi_aa::server::run(
+        crate::aa::serve_wifi(
             livi_aa::consts::TCP_PORT,
             b.sockets.sessions.clone(),
-            move |socket, peer| {
-                crate::aa::announce_session(&events, socket, peer, AaTransport::Wifi, None);
-            },
-        ));
+            b.aa_events.clone(),
+        );
         let android_auto = bt::start_aa(&conn, &adapter)
             .await
             .map_err(|e| e.to_string());
@@ -192,7 +181,7 @@ pub async fn serve(b: Bluetooth, mut stop: watch::Receiver<bool>) -> Result<(), 
     };
     {
         let bus = conn.clone();
-        let deps = livi_runtime::shared_sock::SharedSockDeps {
+        let deps = livi_helper_stack::shared_sock::SharedSockDeps {
             adapter: adapter.clone(),
             wifi_iface: b.cp.wifi_iface.clone(),
             events: shared_events,
@@ -212,7 +201,7 @@ pub async fn serve(b: Bluetooth, mut stop: watch::Receiver<bool>) -> Result<(), 
         };
         let path = b.sockets.shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = livi_runtime::shared_sock::serve(&path, Some(bus), deps).await {
+            if let Err(e) = livi_helper_stack::shared_sock::serve(&path, Some(bus), deps).await {
                 eprintln!("[shared-sock] ended: {e}");
             }
         });
@@ -239,7 +228,7 @@ async fn access_point(cfg: &AaConfig, dongle_ap: bool) -> Told {
     tokio::task::spawn_blocking(move || {
         if dongle_ap {
             let passphrase = base.passphrase.clone();
-            return on_dongle(&base, passphrase);
+            return on_dongle(&base, passphrase, livi_link_host::link::CHOICE);
         }
         let iface = base.wifi_iface.clone();
         let live = livi_link_host::on_air(&iface);
@@ -284,11 +273,4 @@ async fn watch_android_auto(
             }
         });
     }
-}
-
-fn format_mac(mac: &[u8; 6]) -> String {
-    mac.iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
 }

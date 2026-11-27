@@ -8,12 +8,12 @@ use livi_core_proto::state::Maneuver;
 use livi_cp::airplay::{AirplayCommand, AirplayRemote, AirplaySender};
 use livi_cp::stack::AudioProfile;
 use livi_media::compositor::CompositorControl;
-use livi_media::gst_host::GstHost;
+use livi_media::output::Output;
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::*;
-use crate::config_file::tests::TempDir;
+use crate::files::config_file::tests::TempDir;
 
 struct Rig {
     dir: TempDir,
@@ -70,6 +70,7 @@ impl Rig {
             front: livi(),
             sessions: Default::default(),
             now_playing: Default::default(),
+            audio: None,
             video_playback: None,
             telemetry: Default::default(),
             navigation: Default::default(),
@@ -86,7 +87,7 @@ impl Rig {
         let (tx, cmds) = mpsc::unbounded_channel();
         let (aa_tx, mut aa) = mpsc::unbounded_channel();
         let (crop, aa_crop) = watch::channel(None);
-        let gst = GstHost::new(dir.0.join("gst.sock"));
+        let gst = Output::new(dir.0.join("gst.sock"));
         let ctrl = CompositorControl::connect(dir.0.join("ctrl"));
         let plane = MainPlane::new(gst.clone(), ctrl.clone());
         let clusters = ClusterPlanes::new(gst, ctrl);
@@ -107,6 +108,8 @@ impl Rig {
             telemetry: telemetry_tx,
             settings,
             themes: dir.0.join("themes"),
+            mfi_chip: dir.0.join("mfi-chip.json"),
+            ui_keys: tokio::sync::broadcast::channel(8).0,
         };
         let p = Projection::new(
             hub.clone(),
@@ -579,14 +582,14 @@ async fn carplay_keeps_the_media_keys_while_the_radio_plays() {
     rig.drain();
     while radio.try_recv().is_ok() {}
 
-    rig.p.input(press("KeyN"));
+    rig.p.input(press("n"));
     assert_eq!(rig.drain(), [stack(1, StackCmd::Media(media_button::NEXT))]);
 
     rig.hub.update(|s| {
         s.dab.active = true;
         s.dab.playing = true;
     });
-    rig.p.input(press("KeyN"));
+    rig.p.input(press("n"));
     assert_eq!(rig.drain(), [stack(1, StackCmd::Media(media_button::NEXT))]);
     assert!(
         radio.try_recv().is_err(),
@@ -597,24 +600,16 @@ async fn carplay_keeps_the_media_keys_while_the_radio_plays() {
 #[tokio::test]
 async fn keys_follow_the_bindings() {
     let mut rig = Rig::new();
-    rig.p.input(press("KeyN"));
+    rig.p.input(press("n"));
     assert!(rig.drain().is_empty());
     rig.connect(1, true);
     rig.drain();
 
-    for code in [
-        "ArrowLeft",
-        "Digit1",
-        "KeyN",
-        "KeyA",
-        "KeyV",
-        "KeyH",
-        "KeyQ",
-    ] {
+    for code in ["ArrowLeft", "1", "n", "a", "v", "h", "KeyQ"] {
         rig.p.input(press(code));
     }
     rig.p.input(Input::Key {
-        code: "KeyV".into(),
+        code: "v".into(),
         down: false,
     });
     assert_eq!(
@@ -681,7 +676,7 @@ async fn keys_follow_the_bindings() {
             }),
         ),
         ("Backspace", knob(KnobState { back: true, ..none })),
-        ("KeyH", home()),
+        ("h", home()),
         (
             "KeyJ",
             knob(KnobState {
@@ -693,13 +688,13 @@ async fn keys_follow_the_bindings() {
         ("KeyU", StackCmd::KnobSelect(false)),
         ("KeyI", StackCmd::KnobSelect(true)),
         ("KeyE", StackCmd::KnobSelect(false)),
-        ("KeyP", StackCmd::Media(media_button::PLAY_PAUSE)),
+        ("p", StackCmd::Media(media_button::PLAY_PAUSE)),
         ("KeyX", StackCmd::Media(media_button::PLAY)),
         ("KeyY", StackCmd::Media(media_button::PAUSE)),
-        ("KeyB", StackCmd::Media(media_button::PREV)),
-        ("KeyR", StackCmd::Telephony(telephony_button::DROP)),
-        ("Digit0", StackCmd::Telephony(telephony_button::KEY0)),
-        ("Digit9", StackCmd::Telephony(telephony_button::KEY0 + 9)),
+        ("b", StackCmd::Media(media_button::PREV)),
+        ("r", StackCmd::Telephony(telephony_button::DROP)),
+        ("0", StackCmd::Telephony(telephony_button::KEY0)),
+        ("9", StackCmd::Telephony(telephony_button::KEY0 + 9)),
         ("KeyM", StackCmd::Telephony(telephony_button::STAR)),
         ("KeyG", StackCmd::Telephony(telephony_button::POUND)),
         ("KeyO", StackCmd::Telephony(telephony_button::HOOK_SWITCH)),
@@ -709,8 +704,8 @@ async fn keys_follow_the_bindings() {
         assert_eq!(rig.drain(), [stack(1, cmd)], "{code}");
     }
     rig.p.input(press("KeyC"));
-    assert_eq!(rig.hub.watch().borrow().cluster.layout, "livi.navMini");
-    rig.p.input(press("KeyS"));
+    assert_eq!(rig.hub.watch().borrow().cluster.layout, "livi.clusterOnly");
+    rig.p.input(press("s"));
     rig.p.input(press("KeyW"));
     assert!(rig.drain().is_empty());
 }
@@ -725,12 +720,7 @@ async fn the_dashboard_offers_the_layouts_as_arranged() {
     let shown = rig.hub.watch().borrow().cluster.shown.clone();
     assert_eq!(
         shown,
-        [
-            "livi.strip",
-            "livi.navFull",
-            "livi.clusterFull",
-            "livi.clusterOnly"
-        ]
+        ["livi.strip", "livi.clusterOnly", "livi.clusterFull"]
     );
 
     rig.p
@@ -738,7 +728,7 @@ async fn the_dashboard_offers_the_layouts_as_arranged() {
     let patch = rig.patches.try_recv().unwrap();
     assert_eq!(
         patch["dashboardLayouts"]["livi.clusterOnly"],
-        serde_json::json!({ "on": true, "pos": 4 })
+        serde_json::json!({ "on": true, "pos": 2 })
     );
     rig.p
         .arrange_dashboard(rig.p.cluster.moved("livi.clusterOnly", 9));
@@ -791,7 +781,7 @@ async fn the_cluster_follows_the_phone_and_tells_it_livis_own_choice() {
     let mut rig = Rig::new();
     rig.connect(1, true);
     rig.drain();
-    rig.p.input(press("KeyT"));
+    rig.p.input(press("t"));
     assert!(
         rig.drain().is_empty(),
         "the phone draws no theme, it gets no layout"
@@ -801,9 +791,9 @@ async fn the_cluster_follows_the_phone_and_tells_it_livis_own_choice() {
     let cluster = |rig: &Rig| rig.hub.watch().borrow().cluster.clone();
     rig.p.on_event(CpEvent::Cluster {
         id: 1,
-        choice: PhoneChoice::Layout("livi.clusterFull".into()),
+        choice: PhoneChoice::Layout("livi.navMini".into()),
     });
-    assert_eq!(cluster(&rig).layout, "livi.clusterFull");
+    assert_eq!(cluster(&rig).layout, "livi.navMini");
     let dark = PhoneChoice::Appearance(Appearance::Dark);
     rig.p.on_event(CpEvent::Cluster {
         id: 1,
@@ -817,18 +807,18 @@ async fn the_cluster_follows_the_phone_and_tells_it_livis_own_choice() {
 
     rig.p.on_event(CpEvent::Cluster {
         id: 9,
-        choice: PhoneChoice::Layout("livi.navMini".into()),
+        choice: PhoneChoice::Layout("livi.strip".into()),
     });
     assert_eq!(
         cluster(&rig).layout,
-        "livi.clusterFull",
+        "livi.navMini",
         "only the session in front counts"
     );
 
-    rig.p.input(press("KeyT"));
-    assert_eq!(cluster(&rig).layout, "livi.clusterOnly");
+    rig.p.input(press("t"));
+    assert_eq!(cluster(&rig).layout, "livi.clusterFull");
     let to_phone = StackCmd::ClusterLayout(ui_sync::Layout {
-        id: "livi.clusterOnly".into(),
+        id: "livi.clusterFull".into(),
         palette: "default".into(),
         active: vec![("map".into(), "map".into())],
     });
@@ -845,6 +835,49 @@ async fn a_select_key_clicks() {
     assert_eq!(rig.drain(), [stack(1, StackCmd::KnobSelect(true))]);
     tokio::time::sleep(SELECT_RELEASE * 2).await;
     assert_eq!(rig.drain(), [stack(1, StackCmd::KnobSelect(false))]);
+}
+
+#[tokio::test]
+async fn the_telemetry_presses_a_binding_by_its_name() {
+    let mut rig = Rig::new();
+    rig.connect(1, true);
+    rig.want(Front::Projection);
+    rig.drain();
+    let mut cfg = rig.hub.config();
+    cfg.bindings.zoom_in = String::new();
+    rig.p.on_config(&cfg);
+    rig.drain();
+    rig.want(Front::Cluster);
+    rig.drain();
+    rig.p.press_named("zoomIn");
+    rig.p.press_named("zoomOut");
+    rig.p.press_named("nothing");
+    assert_eq!(
+        rig.drain(),
+        [
+            stack(1, StackCmd::MapZoom { zoom_in: true }),
+            stack(1, StackCmd::MapZoom { zoom_in: false }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_named_navigation_key_moves_the_livi_ui_while_it_is_in_front() {
+    let mut rig = Rig::new();
+    rig.connect(1, true);
+    let mut keys = rig.p.ui_keys.subscribe();
+    rig.want(Front::Livi);
+    rig.drain();
+    rig.p.press_named("down");
+    rig.p.press_named("zoomIn");
+    assert_eq!(keys.try_recv().ok().as_deref(), Some("down"));
+    assert!(keys.try_recv().is_err());
+    assert_eq!(rig.drain(), [stack(1, StackCmd::MapZoom { zoom_in: true })]);
+    rig.want(Front::Projection);
+    rig.drain();
+    rig.p.press_named("down");
+    assert!(keys.try_recv().is_err());
+    assert!(!rig.drain().is_empty());
 }
 
 #[tokio::test]
@@ -1183,6 +1216,42 @@ async fn with_no_phone_a_setting_goes_live_once_the_settings_sit_still() {
     rig.p.apply_idle();
     assert!(!rig.hub.apply_pending());
     assert!(!restarted(&rig).await);
+}
+
+#[tokio::test]
+async fn with_no_phone_the_screen_waits_for_apply() {
+    let mut rig = Rig::new();
+    let waiting = |rig: &Rig| rig.hub.watch().borrow().system.apply_pending;
+    rig.settings(|c| c.screen_width_mm.main = 344);
+    rig.drain();
+    assert_eq!(rig.p.apply_due, None);
+    assert!(waiting(&rig));
+    rig.settings(|c| c.wireless_aa_enabled = true);
+    rig.p.apply_idle();
+    assert!(rig.hub.apply_pending());
+    assert_eq!(rig.hub.applied().borrow().screen_width_mm.main, 0);
+    assert!(restarted(&rig).await);
+    rig.drain();
+
+    rig.p.apply_settings();
+    assert!(!rig.hub.apply_pending());
+    assert!(!waiting(&rig));
+    assert!(!restarted(&rig).await);
+    assert!(rig.drain().is_empty(), "no phone to drop");
+}
+
+#[tokio::test]
+async fn applying_only_the_screen_keeps_the_phones() {
+    let mut rig = Rig::new();
+    rig.connect(1, true);
+    rig.drain();
+    rig.settings(|c| c.display_rotation.main = 90);
+    assert!(rig.hub.watch().borrow().system.apply_pending);
+    rig.drain();
+    rig.p.apply_settings();
+    assert_eq!(rig.hub.applied().borrow().display_rotation.main, 90);
+    assert!(!restarted(&rig).await);
+    assert!(rig.drain().is_empty(), "the sessions stay");
 }
 
 #[tokio::test]
@@ -1555,18 +1624,18 @@ async fn android_auto_touches_land_on_its_stream_and_the_voice_key_is_held() {
         )]
     );
 
-    rig.p.input(press("KeyV"));
+    rig.p.input(press("v"));
     rig.p.input(Input::Key {
-        code: "KeyV".into(),
+        code: "v".into(),
         down: false,
     });
     rig.p.input(Input::Key {
-        code: "KeyN".into(),
+        code: "n".into(),
         down: false,
     });
     for code in [
-        "Digit7",
-        "Digit0",
+        "7",
+        "0",
         "KeyQ",
         "ArrowLeft",
         "ArrowRight",
@@ -1575,16 +1644,7 @@ async fn android_auto_touches_land_on_its_stream_and_the_voice_key_is_held() {
     ] {
         rig.p.input(press(code));
     }
-    for code in [
-        "Backspace",
-        "KeyH",
-        "KeyP",
-        "KeyN",
-        "KeyB",
-        "KeyA",
-        "KeyR",
-        "KeyS",
-    ] {
+    for code in ["Backspace", "h", "p", "n", "b", "a", "r", "s"] {
         rig.p.input(press(code));
     }
     rig.p.media(MediaControl::Pause);
@@ -2016,6 +2076,15 @@ async fn an_iphone_mac_is_not_taken_for_an_unnamed_android_auto_session() {
 }
 
 fn airplay(rig: &mut Rig, id: u64, name: &str) -> UnboundedReceiver<AirplayCommand> {
+    airplay_from(rig, id, name, None)
+}
+
+fn airplay_from(
+    rig: &mut Rig,
+    id: u64,
+    name: &str,
+    controller: Option<&str>,
+) -> UnboundedReceiver<AirplayCommand> {
     let (remote, commands) = AirplayRemote::channel();
     rig.p.on_ap(ApEvent::Started {
         id,
@@ -2023,6 +2092,7 @@ fn airplay(rig: &mut Rig, id: u64, name: &str) -> UnboundedReceiver<AirplayComma
         peer: AirplaySender {
             name: Some(name.into()),
             model: None,
+            controller_id: controller.map(str::to_string),
         },
         remote,
     });
@@ -2059,8 +2129,8 @@ async fn media_keys_reach_the_airplay_sender() {
     rig.p.media(MediaControl::PlayPause);
     rig.p.media(MediaControl::Next);
     rig.p.media(MediaControl::Prev);
-    rig.p.key("KeyN", true);
-    rig.p.key("KeyN", false);
+    rig.p.key("n", true);
+    rig.p.key("n", false);
     rig.p.seek(61_500);
     let mut sent = Vec::new();
     while let Ok(c) = commands.try_recv() {
@@ -2102,4 +2172,75 @@ async fn a_mirror_shows_what_carplay_on_the_same_phone_plays() {
     assert_eq!(rig.now_playing().title.as_deref(), Some("Car"));
     rig.meta(1, json!({ "type": "nowplaying", "title": "Next" }));
     assert_eq!(rig.now_playing().title.as_deref(), Some("Next"));
+}
+
+#[tokio::test]
+async fn an_airplay_phone_is_one_entry_that_outlives_its_session() {
+    use livi_core_proto::state::DeviceStatus;
+
+    let mut rig = Rig::new();
+    airplay_from(&mut rig, 1, "LaPhone", Some("c1"));
+    let list = listed(&rig);
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        (
+            list[0].id.as_str(),
+            list[0].name.as_deref(),
+            list[0].protocol
+        ),
+        ("c1", Some("LaPhone"), Some(Protocol::Airplay))
+    );
+    assert_eq!(list[0].session, Some(1));
+
+    rig.p.on_ap(ApEvent::Ended { id: 1 });
+    let list = listed(&rig);
+    assert_eq!(list.len(), 1);
+    assert_eq!(
+        (list[0].status, list[0].session),
+        (DeviceStatus::Offline, None)
+    );
+
+    airplay_from(&mut rig, 2, "LaPhone", Some("c1"));
+    assert_eq!(listed(&rig).len(), 1);
+    rig.p.select_device("c1");
+    assert!(rig.p.sessions[0].active);
+}
+
+#[tokio::test]
+async fn airplay_joins_the_phone_carplay_paired() {
+    let mut rig = Rig::new();
+    rig.p.on_event(CpEvent::Connected {
+        id: 1,
+        wired: false,
+        controller_id: Some("c1".into()),
+    });
+    rig.device(1, false, "AA:BB:CC:DD:EE:01", "cc:dd:ee:ff:00:01");
+    rig.p.on_event(CpEvent::Disconnected { id: 1 });
+
+    airplay_from(&mut rig, 7, "LaPhone", Some("c1"));
+    let list = listed(&rig);
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(
+        (list[0].id.as_str(), list[0].protocol, list[0].session),
+        ("aa:bb:cc:dd:ee:01", Some(Protocol::Carplay), Some(1))
+    );
+}
+
+#[tokio::test]
+async fn carplay_folds_in_the_entry_airplay_started() {
+    let mut rig = Rig::new();
+    airplay_from(&mut rig, 7, "LaPhone", Some("c1"));
+    rig.p.on_ap(ApEvent::Ended { id: 7 });
+    rig.p.on_event(CpEvent::Connected {
+        id: 1,
+        wired: false,
+        controller_id: Some("c1".into()),
+    });
+    rig.device(1, false, "AA:BB:CC:DD:EE:01", "cc:dd:ee:ff:00:01");
+    let list = listed(&rig);
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(
+        (list[0].id.as_str(), list[0].protocol),
+        ("aa:bb:cc:dd:ee:01", Some(Protocol::Carplay))
+    );
 }

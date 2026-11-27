@@ -25,6 +25,7 @@ pub enum Event {
     Changed(BTreeSet<String>),
     Spectrum(Vec<f32>),
     OpenPage(String),
+    Key(String),
     Gone(String),
 }
 
@@ -86,6 +87,7 @@ impl std::fmt::Debug for Client {
 }
 
 pub fn socket_path() -> PathBuf {
+    // SAFETY: getuid has no preconditions.
     livi_core_proto::runtime::core_socket(unsafe { libc::getuid() })
 }
 
@@ -203,6 +205,9 @@ fn read_loop(
                 }
                 Some("openPage") => {
                     emit(Event::OpenPage(msg["path"].as_str().unwrap_or("").into()));
+                }
+                Some("key") => {
+                    emit(Event::Key(msg["name"].as_str().unwrap_or("").into()));
                 }
                 Some("refused") => {
                     return emit(Event::Gone(msg["reason"].as_str().unwrap_or("").into()));

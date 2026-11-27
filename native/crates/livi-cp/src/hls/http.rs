@@ -3,8 +3,6 @@
 // Additional terms: see NOTICE
 
 use super::*;
-use openssl::x509::X509;
-use openssl::x509::store::X509StoreBuilderRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Target<'a> {
@@ -70,38 +68,41 @@ impl<'a> Target<'a> {
 pub(crate) trait Conn: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Conn for T {}
 
-pub(super) fn system_trust() -> io::Result<SslConnector> {
-    static TRUST: OnceLock<SslConnector> = OnceLock::new();
+pub(super) fn system_trust() -> io::Result<Arc<ClientConfig>> {
+    static TRUST: OnceLock<Arc<ClientConfig>> = OnceLock::new();
     if let Some(trust) = TRUST.get() {
         return Ok(trust.clone());
     }
-    let mut trust = SslConnector::builder(SslMethod::tls_client()).map_err(io::Error::other)?;
-    if cfg!(target_os = "macos") {
-        trust
-            .set_ca_file("/etc/ssl/cert.pem")
-            .map_err(io::Error::other)?;
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(system_roots());
+    if roots.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no ca store"));
     }
-    if cfg!(target_os = "android") {
-        android_roots(trust.cert_store_mut())?;
-    }
-    let trust = trust.build();
+    let trust = Arc::new(
+        ClientConfig::builder_with_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .map_err(io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
     Ok(TRUST.get_or_init(|| trust).clone())
 }
 
-fn android_roots(store: &mut X509StoreBuilderRef) -> io::Result<()> {
-    let roots = livi_net::ca::android_roots();
-    if roots.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no android ca store",
-        ));
-    }
-    for pem in roots {
-        if let Ok(cert) = X509::from_pem(&pem) {
-            let _ = store.add_cert(cert);
-        }
-    }
-    Ok(())
+#[cfg(target_os = "android")]
+fn system_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+    livi_net::ca::android_roots()
+        .iter()
+        .filter_map(|pem| CertificateDer::from_pem_slice(pem).ok())
+        .collect()
+}
+
+#[cfg(not(target_os = "android"))]
+fn system_roots() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    rustls_native_certs::load_native_certs().certs
 }
 
 #[derive(Default)]
@@ -122,21 +123,36 @@ impl Client {
     }
 
     #[cfg(test)]
-    pub(crate) fn trusting(mut self, trust: SslConnector) -> Self {
+    pub(crate) fn trusting(mut self, trust: Arc<ClientConfig>) -> Self {
         self.dialer.trust = Some(trust);
         self
     }
 
-    pub async fn get(&mut self, url: &str) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    pub(crate) async fn get(&mut self, url: &str) -> io::Result<Vec<u8>> {
         let target = Target::of(url)?;
         let open = self.take(&target.origin());
-        let reused = open.is_some();
-        match self.exchange(&target, open, url).await {
-            Err(e) if reused && e.kind() != io::ErrorKind::TimedOut => {
-                self.exchange(&target, None, url).await
-            }
-            other => other,
+        let (answer, sock) = self.dialer.get(&target, open, url).await;
+        if let Some(sock) = sock {
+            self.keep(target.origin(), sock);
         }
+        answer
+    }
+
+    pub(crate) async fn get_shared(
+        shared: &tokio::sync::Mutex<Self>,
+        url: &str,
+    ) -> io::Result<Vec<u8>> {
+        let target = Target::of(url)?;
+        let (open, dialer) = {
+            let mut client = shared.lock().await;
+            (client.take(&target.origin()), client.dialer())
+        };
+        let (answer, sock) = dialer.get(&target, open, url).await;
+        if let Some(sock) = sock {
+            shared.lock().await.keep(target.origin(), sock);
+        }
+        answer
     }
 
     pub(crate) fn take(&mut self, origin: &str) -> Option<Box<dyn Conn>> {
@@ -150,17 +166,44 @@ impl Client {
     pub(crate) fn dialer(&self) -> Dialer {
         self.dialer.clone()
     }
+}
 
-    async fn exchange(
-        &mut self,
+#[derive(Clone, Default)]
+pub(crate) struct Dialer {
+    phone: Option<Arc<ProxyOffer>>,
+    trust: Option<Arc<ClientConfig>>,
+}
+
+impl Dialer {
+    async fn get(
+        &self,
         target: &Target<'_>,
         open: Option<Box<dyn Conn>>,
         url: &str,
-    ) -> io::Result<Vec<u8>> {
+    ) -> (io::Result<Vec<u8>>, Option<Box<dyn Conn>>) {
+        let reused = open.is_some();
+        match self.exchange(target, open, url).await {
+            Err(e) if reused && e.kind() != io::ErrorKind::TimedOut => {
+                match self.exchange(target, None, url).await {
+                    Ok((answer, sock)) => (answer, sock),
+                    Err(e) => (Err(e), None),
+                }
+            }
+            Ok((answer, sock)) => (answer, sock),
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    async fn exchange(
+        &self,
+        target: &Target<'_>,
+        open: Option<Box<dyn Conn>>,
+        url: &str,
+    ) -> io::Result<(io::Result<Vec<u8>>, Option<Box<dyn Conn>>)> {
         let fetch = async {
             let mut sock = match open {
                 Some(sock) => sock,
-                None => self.dialer.connect(target).await?,
+                None => self.connect(target).await?,
             };
             let ask = format!(
                 "GET {} HTTP/1.1\r\nHost: {}\r\n\r\n",
@@ -173,24 +216,15 @@ impl Client {
         let (head, body, sock) = tokio::time::timeout(FETCH_TIMEOUT, fetch)
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("{url}: timed out")))??;
-        if let Some(sock) = sock {
-            self.keep(target.origin(), sock);
-        }
-        if head.split(' ').nth(1) != Some("200") {
+        let answer = if head.split(' ').nth(1) == Some("200") {
+            Ok(body)
+        } else {
             let line = head.lines().next().unwrap_or_default().to_string();
-            return Err(io::Error::other(format!("{url}: {line}")));
-        }
-        Ok(body)
+            Err(io::Error::other(format!("{url}: {line}")))
+        };
+        Ok((answer, sock))
     }
-}
 
-#[derive(Clone, Default)]
-pub(crate) struct Dialer {
-    phone: Option<Arc<ProxyOffer>>,
-    trust: Option<SslConnector>,
-}
-
-impl Dialer {
     pub(crate) async fn connect(&self, target: &Target<'_>) -> io::Result<Box<dyn Conn>> {
         let plain: Box<dyn Conn> = match &self.phone {
             Some(phone) => {
@@ -209,13 +243,9 @@ impl Dialer {
             Some(trust) => trust.clone(),
             None => system_trust()?,
         };
-        let ssl = trust.configure().and_then(|c| c.into_ssl(target.name()));
-        let mut tls =
-            SslStream::new(ssl.map_err(io::Error::other)?, plain).map_err(io::Error::other)?;
-        Pin::new(&mut tls)
-            .connect()
-            .await
-            .map_err(io::Error::other)?;
+        let name = ServerName::try_from(target.name().to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let tls = TlsConnector::from(trust).connect(name, plain).await?;
         Ok(Box::new(tls))
     }
 }

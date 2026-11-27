@@ -1,0 +1,876 @@
+// SPDX-FileCopyrightText: 2025-2026 Lasse Heitgres
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Additional terms: see NOTICE
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use livi_base::fs::{SHARED, write_atomic};
+use livi_core_proto::config::Config;
+pub use livi_core_proto::config::defaults;
+use livi_media::compositor::Panel;
+use livi_ui_model::settings::{mask, schema};
+use serde_json::{Map, Value};
+
+pub const CAR_NAME_MAX: usize = 20;
+const WIFI_PASSWORD_LEN: std::ops::RangeInclusive<usize> = 8..=63;
+const OMIT_WHEN_EMPTY: [&str; 3] = ["carplayIcon120", "carplayIcon180", "carplayIcon256"];
+
+#[derive(Default)]
+pub struct HostFacts {
+    pub car_name: Option<String>,
+    pub panel: Option<Panel>,
+}
+
+fn projection_from_panel(w: u32, h: u32) -> (u32, u32) {
+    let (w, h) = (w.max(h), w.min(h));
+    let (w, h) = if w * 1080 >= h * 1920 {
+        let fit = w.min(1920);
+        (fit, h * fit / w.max(1))
+    } else {
+        let fit = h.min(1080);
+        (w * fit / h, fit)
+    };
+    (w & !1, h & !1)
+}
+
+fn plausible_mm(panel: &Panel) -> bool {
+    let px = f64::from(panel.width_px) / f64::from(panel.height_px.max(1));
+    let mm = f64::from(panel.width_mm) / f64::from(panel.height_mm.max(1));
+    panel.width_mm >= 30 && panel.height_mm >= 30 && (mm / px - 1.0).abs() <= 0.1
+}
+
+#[derive(Default)]
+pub struct Board {
+    pub defaults: Map<String, Value>,
+    pub pinned: Map<String, Value>,
+    pub hidden: Vec<String>,
+}
+
+impl Board {
+    pub fn from_env() -> Self {
+        let object = |name: &str| match std::env::var(name) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("[core] {name} is no JSON object: {e}");
+                Map::new()
+            }),
+            Err(_) => Map::new(),
+        };
+        Self {
+            defaults: object("LIVI_BOARD_DEFAULTS"),
+            pinned: object("LIVI_BOARD_PINNED"),
+            hidden: std::env::var("LIVI_BOARD_HIDDEN")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        }
+    }
+
+    fn apply(&self, config: Config) -> Config {
+        if self.pinned.is_empty()
+            && self
+                .hidden
+                .iter()
+                .all(|h| config.hidden_settings.contains(h))
+        {
+            return config;
+        }
+        let Ok(Value::Object(mut fields)) = serde_json::to_value(&config) else {
+            return config;
+        };
+        fields.extend(self.pinned.clone());
+        let mut pinned: Config = match serde_json::from_value(Value::Object(fields)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[core] the board's pinned settings do not fit: {e}");
+                config
+            }
+        };
+        for h in &self.hidden {
+            if !pinned.hidden_settings.contains(h) {
+                pinned.hidden_settings.push(h.clone());
+            }
+        }
+        pinned
+    }
+}
+
+pub struct ConfigFile {
+    path: PathBuf,
+    backup: PathBuf,
+    board: Board,
+}
+
+impl ConfigFile {
+    pub fn new(path: PathBuf, backup: PathBuf) -> Self {
+        Self {
+            path,
+            backup,
+            board: Board::default(),
+        }
+    }
+
+    pub fn with_board(mut self, board: Board) -> Self {
+        self.board = board;
+        self
+    }
+
+    /// [`apply_patch`] with the board's say on top.
+    pub fn patch(&self, current: &Config, patch: &Value) -> Result<Config, String> {
+        apply_patch(current, patch).map(|next| self.board.apply(next))
+    }
+
+    pub fn load(&self, host: &HostFacts) -> Config {
+        let source = [&self.path, &self.backup].into_iter().find(|p| p.exists());
+        let file = source
+            .and_then(|p| read_json(p))
+            .unwrap_or(Value::Object(Map::new()));
+        if source == Some(&self.backup) {
+            println!("[core] config restored from the backup mirror");
+        }
+
+        let mut defaults = defaults();
+        if file.get("carName").is_none()
+            && let Some(name) = &host.car_name
+        {
+            defaults.car_name = name.clone();
+        }
+        if file.get("projectionWidth").is_none()
+            && file.get("projectionHeight").is_none()
+            && let Some(panel) = host.panel
+        {
+            let (w, h) = projection_from_panel(panel.width_px, panel.height_px);
+            println!("[core] projection defaults from the panel: {w}x{h}");
+            defaults.projection_width = w;
+            defaults.projection_height = h;
+            defaults.cluster_width = w;
+            defaults.cluster_height = h;
+        }
+        if file.get("screenWidthMm").is_none()
+            && file.get("screenHeightMm").is_none()
+            && let Some(panel) = host.panel.filter(plausible_mm)
+        {
+            println!(
+                "[core] screen size defaults from the panel: {}x{} mm",
+                panel.width_mm, panel.height_mm
+            );
+            defaults.screen_width_mm.main = panel.width_mm;
+            defaults.screen_height_mm.main = panel.height_mm;
+        }
+
+        let mut named = current_names(&file);
+        if let Value::Object(fields) = &mut named {
+            for (k, v) in &self.board.defaults {
+                fields.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        let mut config = self.board.apply(merge(&named, &defaults));
+        keep_known_hidden(&mut config);
+        config.settle_night_modes(|_| false);
+        if !WIFI_PASSWORD_LEN.contains(&config.wifi_password.chars().count()) {
+            println!("[core] wifiPassword is no WPA passphrase, falling back to the default");
+            config.wifi_password = self::defaults().wifi_password;
+        }
+
+        if !self.path.exists() || file != for_file(&config, &self.board) {
+            match self.save(&config) {
+                Ok(()) => println!("[core] wrote the corrected config"),
+                Err(e) => eprintln!("[core] cannot write {}: {e}", self.path.display()),
+            }
+        }
+        config
+    }
+
+    pub fn save(&self, config: &Config) -> io::Result<()> {
+        let json = serde_json::to_string_pretty(&for_file(config, &self.board))?;
+        write_atomic(&self.path, &json, SHARED)?;
+        if let Err(e) = write_atomic(&self.backup, &json, SHARED) {
+            eprintln!("[core] config backup mirror failed: {e}");
+        }
+        Ok(())
+    }
+}
+
+fn read_json(path: &Path) -> Option<Value> {
+    let text = fs::read_to_string(path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!(
+                "[core] {} is no valid JSON, using the defaults: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn for_file(config: &Config, board: &Board) -> Value {
+    let mut config = config.clone();
+    config.hidden_settings.retain(|h| !board.hidden.contains(h));
+    let mut value = serde_json::to_value(&config).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        for key in OMIT_WHEN_EMPTY {
+            if map
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                map.remove(key);
+            }
+        }
+    }
+    value
+}
+
+fn current_names(file: &Value) -> Value {
+    let mut file = file.clone();
+    let Value::Object(top) = &mut file else {
+        return file;
+    };
+    for (old, new) in [
+        ("dashScreenBounds", "clusterScreenBounds"),
+        ("dashScreenActive", "clusterScreenActive"),
+        ("dashScreenWidth", "clusterScreenWidth"),
+        ("dashScreenHeight", "clusterScreenHeight"),
+    ] {
+        rename(top, old, new);
+    }
+    if let Some(Value::String(main)) = top.get("displayMode") {
+        let screens = [
+            ("main", main.clone()),
+            ("cluster", String::new()),
+            ("aux", String::new()),
+        ]
+        .map(|(s, m)| (s.to_string(), Value::String(m)));
+        top.insert(
+            "displayMode".to_string(),
+            Value::Object(screens.into_iter().collect()),
+        );
+    }
+    for per_screen in ["kiosk", "camera", "media"] {
+        if let Some(Value::Object(screens)) = top.get_mut(per_screen) {
+            rename(screens, "dash", "cluster");
+        }
+    }
+    if let Some(Value::Object(slots)) = top.remove("dashboards")
+        && !top.contains_key("dashboard")
+    {
+        let on = |screen: &str| {
+            slots.values().any(|slot| {
+                let flag = |name: &str| slot.get(name).and_then(Value::as_bool) == Some(true);
+                flag(screen) || (screen == "cluster" && flag("dash"))
+            })
+        };
+        let screens = ["main", "cluster", "aux"].map(|s| (s.to_string(), Value::Bool(on(s))));
+        top.insert(
+            "dashboard".to_string(),
+            Value::Object(screens.into_iter().collect()),
+        );
+    }
+    file
+}
+
+fn rename(map: &mut Map<String, Value>, old: &str, new: &str) {
+    if let Some(value) = map.remove(old)
+        && !map.contains_key(new)
+    {
+        map.insert(new.to_string(), value);
+    }
+}
+
+fn merge(file: &Value, defaults: &Config) -> Config {
+    let schema = serde_json::to_value(defaults).unwrap_or(Value::Null);
+    let mut merged = keep_typed(file, &schema);
+    if let (Value::Object(out), Value::Object(src), Value::Object(known)) =
+        (&mut merged, file, &schema)
+    {
+        for (key, value) in src {
+            if !known.contains_key(key) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if let Ok(config) = serde_json::from_value(merged.clone()) {
+        return config;
+    }
+    let (Value::Object(fields), Value::Object(known)) = (&mut merged, &schema) else {
+        return defaults.clone();
+    };
+    let keys: Vec<String> = fields.keys().cloned().collect();
+    for key in keys {
+        let mut alone = known.clone();
+        alone.insert(key.clone(), fields[&key].clone());
+        if serde_json::from_value::<Config>(Value::Object(alone)).is_err() {
+            match known.get(&key) {
+                Some(def) => fields.insert(key, def.clone()),
+                None => fields.remove(&key),
+            };
+        }
+    }
+    serde_json::from_value(merged).unwrap_or_else(|_| defaults.clone())
+}
+
+fn keep_typed(input: &Value, schema: &Value) -> Value {
+    let Value::Object(schema) = schema else {
+        return schema.clone();
+    };
+    let source = input.as_object();
+    let mut out = Map::new();
+    for (key, def) in schema {
+        let chosen = match (source.and_then(|s| s.get(key)), def) {
+            (None, _) => def.clone(),
+            (Some(v), Value::Object(fields)) if v.is_object() && fields.is_empty() => v.clone(),
+            (Some(v), Value::Object(_)) if v.is_object() => keep_typed(v, def),
+            (Some(v), _) if same_type(v, def) => v.clone(),
+            _ => def.clone(),
+        };
+        out.insert(key.clone(), chosen);
+    }
+    Value::Object(out)
+}
+
+fn same_type(a: &Value, b: &Value) -> bool {
+    matches!(
+        (a, b),
+        (Value::Bool(_), Value::Bool(_))
+            | (Value::Number(_), Value::Number(_))
+            | (Value::String(_), Value::String(_))
+            | (Value::Array(_), Value::Array(_))
+    )
+}
+
+fn merge_into(fields: &mut Map<String, Value>, key: &str, v: &Value) {
+    match (fields.get_mut(key), v) {
+        (Some(Value::Object(now)), Value::Object(changed)) => {
+            for (k, inner) in changed {
+                if inner.is_null() {
+                    now.remove(k);
+                } else {
+                    merge_into(now, k, inner);
+                }
+            }
+        }
+        _ => {
+            fields.insert(key.to_string(), v.clone());
+        }
+    }
+}
+
+pub fn apply_patch(current: &Config, patch: &Value) -> Result<Config, String> {
+    let Value::Object(patch) = patch else {
+        return Err("the patch is no object".into());
+    };
+    let mut value = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let Value::Object(fields) = &mut value else {
+        return Err("config is no object".into());
+    };
+    for (key, v) in patch {
+        if v.is_null() {
+            fields.remove(key);
+        } else {
+            merge_into(fields, key, v);
+        }
+    }
+    let next: Config = serde_json::from_value(value).map_err(|e| format!("rejected: {e}"))?;
+
+    let written = serde_json::to_value(&next).map_err(|e| e.to_string())?;
+    if let Some(unknown) = patch
+        .iter()
+        .find(|(k, v)| !v.is_null() && written.get(*k).is_none())
+    {
+        return Err(format!("unknown setting {}", unknown.0));
+    }
+    if next.wifi_password != current.wifi_password
+        && !WIFI_PASSWORD_LEN.contains(&next.wifi_password.chars().count())
+    {
+        return Err("wifiPassword needs 8 to 63 characters".into());
+    }
+    let mut next = next;
+    next.settle_night_modes(|key| patch.contains_key(key));
+    if patch.contains_key("hiddenSettings") {
+        keep_known_hidden(&mut next);
+    }
+    Ok(next)
+}
+
+fn keep_known_hidden(config: &mut Config) {
+    if config.hidden_settings.is_empty() {
+        return;
+    }
+    let root = schema();
+    let known = serde_json::to_value(defaults()).unwrap_or(Value::Null);
+    config.hidden_settings.retain(|entry| {
+        let keep = mask::known(entry, &root, &known);
+        if !keep {
+            println!("[core] hiddenSettings: {entry} is no setting, dropped");
+        }
+        keep
+    });
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use livi_core_proto::config::AppearanceMode;
+    use livi_core_proto::state::PerScreen;
+    use serde_json::json;
+
+    use super::*;
+
+    fn panel(width_px: u32, height_px: u32, width_mm: u32, height_mm: u32) -> Panel {
+        Panel {
+            width_mm,
+            height_mm,
+            width_px,
+            height_px,
+        }
+    }
+
+    fn px_only(width_px: u32, height_px: u32) -> Panel {
+        panel(width_px, height_px, 0, 0)
+    }
+
+    pub struct TempDir(pub PathBuf);
+
+    impl TempDir {
+        pub fn new() -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("livi-core-test-{}-{n}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file_in(dir: &TempDir) -> ConfigFile {
+        ConfigFile::new(
+            dir.0.join("LIVI/config.json"),
+            dir.0.join("backup/config.json"),
+        )
+    }
+
+    fn written(dir: &TempDir, rel: &str) -> Value {
+        serde_json::from_str(&fs::read_to_string(dir.0.join(rel)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_fresh_install_writes_the_defaults_and_their_mirror() {
+        let dir = TempDir::new();
+        let config = file_in(&dir).load(&HostFacts::default());
+        assert_eq!(config, defaults());
+        let live = written(&dir, "LIVI/config.json");
+        assert_eq!(live, written(&dir, "backup/config.json"));
+        assert_eq!(live["carName"], "LIVI");
+        assert!(live.get("carplayIcon120").is_none());
+    }
+
+    #[test]
+    fn a_fresh_install_takes_the_host_name_and_the_panel() {
+        let dir = TempDir::new();
+        let host = HostFacts {
+            car_name: Some("golf".into()),
+            panel: Some(px_only(1920, 1200)),
+        };
+        let config = file_in(&dir).load(&host);
+        assert_eq!(config.car_name, "golf");
+        assert_eq!(
+            (config.projection_width, config.projection_height),
+            (1728, 1080)
+        );
+        assert_eq!((config.cluster_width, config.cluster_height), (1728, 1080));
+    }
+
+    #[test]
+    fn a_fresh_install_takes_the_screen_size_the_panel_reports() {
+        let dir = TempDir::new();
+        let host = HostFacts {
+            car_name: None,
+            panel: Some(panel(3840, 2160, 609, 355)),
+        };
+        let config = file_in(&dir).load(&host);
+        assert_eq!(
+            (config.screen_width_mm.main, config.screen_height_mm.main),
+            (609, 355)
+        );
+        assert_eq!(config.screen_width_mm.cluster, 0);
+    }
+
+    #[test]
+    fn a_size_that_does_not_match_the_pixels_is_left_out() {
+        assert!(plausible_mm(&panel(1920, 1080, 344, 194)));
+        assert!(!plausible_mm(&panel(1920, 1080, 16, 9)));
+        assert!(!plausible_mm(&panel(1920, 1080, 300, 300)));
+        assert!(!plausible_mm(&px_only(1920, 1080)));
+        let dir = TempDir::new();
+        let host = HostFacts {
+            car_name: None,
+            panel: Some(panel(1024, 768, 160, 90)),
+        };
+        assert_eq!(file_in(&dir).load(&host).screen_width_mm.main, 0);
+    }
+
+    #[test]
+    fn a_panel_above_1080p_starts_the_projection_at_1080p() {
+        assert_eq!(projection_from_panel(3840, 2160), (1920, 1080));
+        assert_eq!(projection_from_panel(1280, 720), (1280, 720));
+        assert_eq!(projection_from_panel(800, 480), (800, 480));
+        assert_eq!(projection_from_panel(2388, 1668), (1546, 1080));
+    }
+
+    #[test]
+    fn a_portrait_panel_gives_a_landscape_projection() {
+        let dir = TempDir::new();
+        let host = HostFacts {
+            car_name: None,
+            panel: Some(px_only(1080, 2400)),
+        };
+        let config = file_in(&dir).load(&host);
+        assert_eq!(
+            (config.projection_width, config.projection_height),
+            (1920, 864)
+        );
+    }
+
+    #[test]
+    fn the_old_dash_names_come_over_and_are_written_under_the_new_ones() {
+        let dir = TempDir::new();
+        let bounds = json!({ "x": 8, "y": 31, "width": 1211, "height": 678 });
+        let file = json!({
+            "dashScreenActive": true,
+            "dashScreenWidth": 1024,
+            "dashScreenHeight": 600,
+            "dashScreenBounds": bounds,
+            "clusterScreenHeight": 480,
+            "displayMode": "1920x1080",
+            "kiosk": { "main": false, "dash": true, "aux": false },
+            "media": { "main": true, "dash": true, "aux": false },
+            "dashboards": {
+                "dash1": { "main": false, "dash": false, "aux": false, "pos": 1 },
+                "dash2": { "main": false, "dash": true, "aux": false, "pos": 2 },
+                "dash3": { "main": true, "dash": true, "aux": false, "pos": 3 },
+                "dash4": { "main": false, "dash": false, "aux": true, "pos": 4 }
+            }
+        });
+        fs::create_dir_all(dir.0.join("LIVI")).unwrap();
+        fs::write(dir.0.join("LIVI/config.json"), file.to_string()).unwrap();
+
+        let host = HostFacts {
+            car_name: None,
+            panel: None,
+        };
+        let config = file_in(&dir).load(&host);
+        assert!(config.cluster_screen_active);
+        assert_eq!(
+            (config.cluster_screen_width, config.cluster_screen_height),
+            (1024, 480)
+        );
+        assert_eq!(config.cluster_screen_bounds.map(|b| b.width), Some(1211));
+        assert_eq!(config.display_mode.main, "1920x1080");
+        assert_eq!(config.display_mode.cluster, "");
+        assert_eq!(
+            config.kiosk,
+            PerScreen {
+                main: false,
+                cluster: true,
+                aux: false
+            }
+        );
+        assert!(config.media.cluster);
+        assert_eq!(
+            config.dashboard,
+            PerScreen {
+                main: true,
+                cluster: true,
+                aux: true
+            },
+            "a screen keeps the dashboard when any of the four was on there"
+        );
+
+        let live = written(&dir, "LIVI/config.json");
+        let text = live.to_string();
+        for old in ["\"dash\":", "\"dash1\":", "\"dashboards\"", "\"dashScreen"] {
+            assert!(!text.contains(old), "{old} is left: {text}");
+        }
+        assert_eq!(live["clusterScreenWidth"], 1024);
+        assert_eq!(live["dashboard"]["cluster"], true);
+    }
+
+    #[test]
+    fn a_display_mode_per_screen_survives_loading() {
+        let file = json!({ "displayMode": { "main": "1920x1080", "cluster": "", "aux": "" } });
+        let config = merge(&current_names(&file), &defaults());
+        assert_eq!(config.display_mode.main, "1920x1080");
+    }
+
+    #[test]
+    fn maps_keep_their_entries() {
+        let file = json!({ "clusterPalettes": { "livi.dark": "#112233" } });
+        let config = merge(&file, &defaults());
+        assert_eq!(config.cluster_palettes["livi.dark"], "#112233");
+        let broken = json!({ "clusterPalettes": { "livi.dark": 7 } });
+        assert!(merge(&broken, &defaults()).cluster_palettes.is_empty());
+    }
+
+    #[test]
+    fn values_of_the_wrong_type_fall_back_one_by_one() {
+        let dir = TempDir::new();
+        let file = json!({
+            "carName": "Bulli",
+            "huVolume": "loud",
+            "wifiChannel": 36.5,
+            "kiosk": { "main": true, "cluster": "yes" },
+            "evConnectorTypes": [999],
+            "lastKnownGps": { "lat": 52.5, "lng": 13.4, "ts": 1700000000000u64 },
+            "dongleEra": true
+        });
+        fs::create_dir_all(dir.0.join("LIVI")).unwrap();
+        fs::write(dir.0.join("LIVI/config.json"), file.to_string()).unwrap();
+
+        let host = HostFacts {
+            car_name: Some("ignored".into()),
+            panel: Some(px_only(800, 480)),
+        };
+        let config = file_in(&dir).load(&host);
+        assert_eq!(config.car_name, "Bulli");
+        assert_eq!(config.hu_volume, 0.95);
+        assert_eq!(config.wifi_channel, 36);
+        assert_eq!(
+            config.kiosk,
+            PerScreen {
+                main: true,
+                cluster: false,
+                aux: false
+            }
+        );
+        assert_eq!(config.ev_connector_types, Some(Vec::new()));
+        assert_eq!(
+            (config.projection_width, config.projection_height),
+            (800, 480)
+        );
+
+        let live = written(&dir, "LIVI/config.json");
+        assert!(live.get("dongleEra").is_none());
+        assert!(
+            live.get("lastKnownGps").is_none(),
+            "the last position lives in state/gps.json"
+        );
+    }
+
+    #[test]
+    fn broken_json_and_a_short_password_fall_back() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.0.join("LIVI")).unwrap();
+        fs::write(dir.0.join("LIVI/config.json"), "{ nope").unwrap();
+        assert_eq!(file_in(&dir).load(&HostFacts::default()), defaults());
+
+        fs::write(
+            dir.0.join("LIVI/config.json"),
+            json!({ "wifiPassword": "short" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            file_in(&dir).load(&HostFacts::default()).wifi_password,
+            "12345678"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_restored_from_the_mirror() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.0.join("backup")).unwrap();
+        fs::write(
+            dir.0.join("backup/config.json"),
+            json!({ "carName": "Restored" }).to_string(),
+        )
+        .unwrap();
+        let config = file_in(&dir).load(&HostFacts::default());
+        assert_eq!(config.car_name, "Restored");
+        assert_eq!(written(&dir, "LIVI/config.json")["carName"], "Restored");
+    }
+
+    #[test]
+    fn the_night_modes_start_from_the_phone_appearance() {
+        let dir = TempDir::new();
+        let file = file_in(&dir);
+        let path = dir.0.join("LIVI/config.json");
+        assert_eq!(file.load(&HostFacts::default()).night_modes(), [true; 4]);
+        fs::write(
+            &path,
+            r#"{ "appearanceMode": "day", "mainMapNightMode": true }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            file.load(&HostFacts::default()).night_modes(),
+            [false; 4],
+            "Day fixes them all"
+        );
+        fs::write(
+            &path,
+            r#"{ "appearanceMode": "auto", "mainUiNightMode": false, "mainMapNightMode": false }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            file.load(&HostFacts::default()).night_modes(),
+            [false, false, true, true],
+            "Auto keeps the saved ones"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_file_is_left_alone() {
+        let dir = TempDir::new();
+        let file = file_in(&dir);
+        file.load(&HostFacts::default());
+        let path = dir.0.join("LIVI/config.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&for_file(&defaults(), &Board::default())).unwrap(),
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        file.load(&HostFacts::default());
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_patch_replaces_fields_and_merges_bindings() {
+        let next = apply_patch(
+            &defaults(),
+            &json!({ "huVolume": 0.5, "kiosk": { "main": true, "cluster": false, "aux": false },
+                     "bindings": { "home": "KeyX" } }),
+        )
+        .unwrap();
+        assert_eq!(next.hu_volume, 0.5);
+        assert!(next.kiosk.main);
+        assert_eq!(next.bindings.home, "KeyX");
+        assert_eq!(next.bindings.play_pause, "p");
+    }
+
+    #[test]
+    fn one_screen_of_a_per_screen_setting_changes_alone() {
+        let before = defaults();
+        let next = apply_patch(&before, &json!({ "camera": { "cluster": true } })).unwrap();
+        assert!(next.camera.cluster);
+        assert_eq!(next.camera.main, before.camera.main);
+        assert_eq!(next.camera.aux, before.camera.aux);
+        let off = apply_patch(&next, &json!({ "camera": { "main": false } })).unwrap();
+        assert!(!off.camera.main);
+        assert!(off.camera.cluster);
+    }
+
+    #[test]
+    fn a_screen_view_area_edge_changes_alone_and_leaves_the_projection() {
+        let before = defaults();
+        assert_eq!(before.view_area.main.top, 0);
+        let next = apply_patch(
+            &before,
+            &json!({ "viewArea": { "cluster": { "left": 40 } } }),
+        )
+        .unwrap();
+        assert_eq!(next.view_area.cluster.left, 40);
+        assert_eq!(next.view_area.cluster.top, 0);
+        assert_eq!(next.view_area.main, before.view_area.main);
+        assert_eq!(next.cluster_view_area_left, before.cluster_view_area_left);
+    }
+
+    #[test]
+    fn null_clears_only_optional_fields() {
+        let next = apply_patch(&defaults(), &json!({ "primaryColorDark": null })).unwrap();
+        assert_eq!(next.primary_color_dark, None);
+        assert!(apply_patch(&defaults(), &json!({ "carName": null })).is_err());
+        let mut palettes = defaults();
+        palettes
+            .cluster_palettes
+            .insert("livi.dark".into(), "#112233".into());
+        let next = apply_patch(
+            &palettes,
+            &json!({ "clusterPalettes": { "livi.dark": null } }),
+        )
+        .unwrap();
+        assert!(next.cluster_palettes.is_empty());
+        assert!(apply_patch(&defaults(), &json!({ "kiosk": { "main": null } })).is_err());
+    }
+
+    #[test]
+    fn a_patch_that_does_not_fit_changes_nothing() {
+        let current = defaults();
+        assert!(apply_patch(&current, &json!({ "huVolume": "loud" })).is_err());
+        assert!(apply_patch(&current, &json!({ "wifiChannel": 36.5 })).is_err());
+        assert_eq!(
+            apply_patch(&current, &json!({ "nightMode": true })),
+            Err("unknown setting nightMode".into())
+        );
+        assert!(apply_patch(&current, &json!({ "wifiPassword": "short" })).is_err());
+        let light = apply_patch(&current, &json!({ "mainUiNightMode": false })).unwrap();
+        assert_eq!(light.night_modes(), [false, false, true, true]);
+        assert_eq!(light.appearance_mode, AppearanceMode::Auto);
+        let day = apply_patch(&light, &json!({ "appearanceMode": "day" })).unwrap();
+        assert_eq!(day.night_modes(), [false; 4]);
+        assert!(apply_patch(&current, &json!([1])).is_err());
+    }
+
+    #[test]
+    fn hidden_settings_keep_only_routes_and_keys() {
+        let next = apply_patch(
+            &defaults(),
+            &json!({ "hiddenSettings": ["gps", "mainScreen.viewArea", "dashboard.cluster", "nope"] }),
+        )
+        .unwrap();
+        assert_eq!(
+            next.hidden_settings,
+            ["gps", "mainScreen.viewArea", "dashboard.cluster"]
+        );
+        let file = json!({ "hiddenSettings": ["fm", "gone.away"] });
+        let mut loaded = merge(&file, &defaults());
+        keep_known_hidden(&mut loaded);
+        assert_eq!(loaded.hidden_settings, ["fm"]);
+    }
+
+    fn board() -> Board {
+        Board {
+            defaults: json!({ "uiZoomPercent": 160 }).as_object().unwrap().clone(),
+            pinned: json!({ "projectionFps": 30 }).as_object().unwrap().clone(),
+            hidden: vec!["projectionFps".into()],
+        }
+    }
+
+    #[test]
+    fn the_board_fills_pins_and_hides_but_the_file_keeps_the_user_choice() {
+        let dir = TempDir::new();
+        let file = file_in(&dir).with_board(board());
+        fs::create_dir_all(dir.0.join("LIVI")).unwrap();
+        fs::write(
+            dir.0.join("LIVI/config.json"),
+            r#"{"projectionFps":60,"hiddenSettings":["fm"]}"#,
+        )
+        .unwrap();
+        let config = file.load(&HostFacts::default());
+        assert_eq!(config.ui_zoom_percent, 160);
+        assert_eq!(config.projection_fps, 30);
+        assert_eq!(config.hidden_settings, ["fm", "projectionFps"]);
+        assert_eq!(
+            written(&dir, "LIVI/config.json")["hiddenSettings"],
+            json!(["fm"])
+        );
+
+        let next = file
+            .patch(&config, &json!({ "projectionFps": 60 }))
+            .unwrap();
+        assert_eq!(next.projection_fps, 30);
+        assert_eq!(next.hidden_settings, ["fm", "projectionFps"]);
+    }
+}

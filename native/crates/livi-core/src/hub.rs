@@ -78,12 +78,16 @@ impl Hub {
         self.applied.subscribe()
     }
 
+    #[cfg(test)]
     pub fn apply_pending(&self) -> bool {
         *self.applied.borrow() != self.config()
     }
 
-    pub fn apply(&self) -> Option<(Config, Config)> {
-        let next = self.config();
+    pub fn applied_config(&self) -> Config {
+        self.applied.borrow().clone()
+    }
+
+    pub fn apply(&self, next: Config) -> Option<(Config, Config)> {
         let before = self.applied.borrow().clone();
         if before == next {
             return None;
@@ -125,6 +129,7 @@ impl Hub {
 macro_rules! sections {
     ($then:ident) => {
         $then!(
+            audio "audio",
             cameras "cameras",
             cluster "cluster",
             config "config",
@@ -180,7 +185,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config_file::defaults;
+    use crate::files::config_file::defaults;
 
     fn hub() -> Hub {
         let livi = PerScreen {
@@ -192,6 +197,7 @@ mod tests {
             front: livi,
             sessions: Default::default(),
             now_playing: Default::default(),
+            audio: None,
             video_playback: None,
             telemetry: Default::default(),
             navigation: Default::default(),

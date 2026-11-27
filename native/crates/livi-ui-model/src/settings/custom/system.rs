@@ -183,6 +183,72 @@ pub fn statistics(state: &Value, t: &Strings) -> Vec<Row> {
     rows
 }
 
+pub fn audio(state: &Value, t: &Strings) -> Vec<Row> {
+    let stream = &state["audio"];
+    let number = |key: &str, unit: &str| match stream[key].as_u64() {
+        Some(n) => format!("{n}{unit}"),
+        None => DASH.to_string(),
+    };
+    let rate = match stream["rate"].as_f64() {
+        Some(hz) => format!("{} kHz", hz / 1000.0),
+        None => DASH.to_string(),
+    };
+    let codec = stream["codec"].as_str();
+    let kind = match stream["buffered"].as_bool() {
+        Some(true) => t.t("settings.audioBuffered", "Buffered"),
+        Some(false) => t.t("settings.audioRealtime", "Realtime"),
+        None => DASH.to_string(),
+    };
+    let bits = if stream["bits"].as_u64() == Some(0) {
+        t.t("settings.audioBitDepthVariable", "Variable")
+    } else {
+        number("bits", " bit")
+    };
+    let (buffer_key, buffer_text) = if stream["buffered"].as_bool() == Some(false) {
+        ("settings.audioLatency", "Output Latency")
+    } else {
+        ("settings.audioBuffer", "Buffer")
+    };
+    let target = stream["targetMs"].as_u64().filter(|ms| *ms > 0);
+    let ahead = match (stream["bufferMs"].as_u64(), target) {
+        (Some(ms), Some(target)) => {
+            let off = (ms as f64 / target as f64 - 1.0) * 100.0;
+            format!("{ms} ms ({off:+.0} %)")
+        }
+        (Some(ms), None) => format!("{ms} ms"),
+        (None, _) => DASH.to_string(),
+    };
+    let target = target.map_or(DASH.to_string(), |ms| format!("{ms} ms"));
+    let row = |key: &str, text: &str, icon: &'static str, value: String| Row {
+        mono: true,
+        ..info(t.t(key, text), Some(icon), value)
+    };
+    vec![
+        row(
+            "settings.audioCodec",
+            "Codec",
+            "audioCodec",
+            codec.unwrap_or(DASH).to_string(),
+        ),
+        row(
+            "settings.audioSampleRate",
+            "Sample Rate",
+            "audioSampleRate",
+            rate,
+        ),
+        row("settings.audioBitDepth", "Bit Depth", "audioBitDepth", bits),
+        row(
+            "settings.audioChannels",
+            "Channels",
+            "audioChannels",
+            number("channels", ""),
+        ),
+        row("settings.audioStream", "Stream", "audioStream", kind),
+        row(buffer_key, buffer_text, "audioBuffer", ahead),
+        row("settings.audioTarget", "Target", "audioTarget", target),
+    ]
+}
+
 fn semver(v: &str) -> Option<[u64; 3]> {
     let mut it = v.trim().split('.').map(|p| p.parse::<u64>().ok());
     let out = [it.next()??, it.next()??, it.next()??];
@@ -461,6 +527,20 @@ mod tests {
 
     fn state(update: Value, nightly: bool) -> Value {
         json!({ "config": { "updateNightly": nightly }, "update": update })
+    }
+
+    #[test]
+    fn the_buffer_shows_how_far_it_is_off_its_target() {
+        let value = |audio: Value, label: &str| {
+            let rows = super::audio(&json!({ "audio": audio }), &Strings::new("en"));
+            rows.into_iter().find(|r| r.label == label).unwrap().value
+        };
+        let held = json!({ "buffered": true, "bufferMs": 250, "targetMs": 200 });
+        assert_eq!(value(held.clone(), "Buffer"), "250 ms (+25 %)");
+        assert_eq!(value(held, "Target"), "200 ms");
+        let free = json!({ "buffered": true, "bufferMs": 250 });
+        assert_eq!(value(free.clone(), "Buffer"), "250 ms");
+        assert_eq!(value(free, "Target"), DASH);
     }
 
     #[test]

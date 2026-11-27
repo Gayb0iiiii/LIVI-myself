@@ -15,6 +15,7 @@ use livi_aa_stack::commands::{Command, TouchAction, TouchItem};
 use livi_aa_stack::driver::SessionCmd;
 use livi_aa_stack::manager::{AaCmd, AaEvent, AaHandle, SessionId as AaId};
 use livi_aa_stack::media::AudioKind as AaKind;
+use livi_core_proto::apply;
 use livi_core_proto::config::{Config, KeyBindings};
 use livi_core_proto::helper_events::{HelperKind, NowPlayingPatch};
 use livi_core_proto::ids::Ids;
@@ -28,38 +29,54 @@ use livi_cp::hid::{KnobState, media_button, telephony_button};
 use livi_cp::manager::{CallPhase, CpCmd, CpEvent, CpHandle, HelperPresence, Presence, SessionId};
 use livi_cp::stack::{AudioKind, StackCmd, Touch};
 use livi_cp::ui_sync::{self, Appearance, PhoneChoice};
-use livi_host_proto::{PLANE_AIRPLAY, PLANE_MAIN};
-use livi_media::gst_host::HostEvent;
+use livi_media::output::OutputEvent;
 use livi_media::planes::{ClusterPlanes, Crop, MainPlane};
+use livi_output_proto::{PLANE_AIRPLAY, PLANE_MAIN};
 use serde_json::{Map, Value};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
-use crate::aa_telemetry::{self, AaTelemetry};
-use crate::android_auto;
-use crate::cp_telemetry::{CpTelemetry, FROM_CARPLAY};
+use crate::audio::spectrum;
 use crate::devices::{self, Devices, Seen};
-use crate::hands_free::{self, Back, HandsFree, Io};
+use crate::files::status_file::Activity;
 use crate::helper;
 use crate::hub::Hub;
-use crate::nav_text;
-use crate::spectrum;
-use crate::status_file::Activity;
-use crate::telemetry::{CLIMATE, NOTIFICATION, SOURCE};
-use crate::theme_catalog::{self, ThemeId};
 use crate::update::UpdateAsk;
+use crate::vehicle::aa_telemetry::{self, AaTelemetry};
+use crate::vehicle::cp_telemetry::{CpTelemetry, FROM_CARPLAY};
+use crate::vehicle::telemetry::{CLIMATE, NOTIFICATION, SOURCE};
+use hands_free::{Back, HandsFree, Io};
+use theme_catalog::ThemeId;
 
 pub use ap::ApEvent;
 
+static FOREGROUND: std::sync::OnceLock<broadcast::Sender<()>> = std::sync::OnceLock::new();
+
+fn foreground() -> &'static broadcast::Sender<()> {
+    FOREGROUND.get_or_init(|| broadcast::channel(1).0)
+}
+
+pub fn foregrounded() {
+    let _ = foreground().send(());
+}
+
 mod aa;
+pub mod airplay;
+pub mod android_auto;
 mod ap;
 mod audio;
+pub mod carplay;
 mod cluster;
 mod cp;
+pub mod cp_radio;
+pub mod hands_free;
 mod input;
+pub mod nav_text;
 mod players;
 mod screens;
 mod sessions;
 mod state;
+#[cfg_attr(not(feature = "net"), allow(dead_code, unused_imports))]
+pub mod theme_catalog;
 
 const RAMP_DOWN_MS: u32 = 500;
 const RAMP_UP_MS: u32 = 1500;
@@ -215,6 +232,8 @@ enum Key {
     CycleSession,
     ClusterLayout,
     ClusterContent,
+    ZoomIn,
+    ZoomOut,
     PlayPause,
     Play,
     Pause,
@@ -240,6 +259,8 @@ impl Key {
                 | Key::AcceptPhone
                 | Key::RejectPhone
                 | Key::VoiceAssistant
+                | Key::ZoomIn
+                | Key::ZoomOut
         )
     }
 
@@ -255,51 +276,71 @@ impl Key {
     }
 }
 
-fn bound(b: &KeyBindings, code: &str) -> Option<Key> {
+fn keys(b: &KeyBindings) -> [(&'static str, &String, Key); 39] {
     use telephony_button as t;
-    let table = [
-        (&b.up, Key::Up),
-        (&b.down, Key::Down),
-        (&b.left, Key::Left),
-        (&b.right, Key::Right),
-        (&b.select_up, Key::SelectUp),
-        (&b.select_down, Key::SelectDown),
-        (&b.back, Key::Back),
-        (&b.knob_left, Key::KnobLeft),
-        (&b.knob_right, Key::KnobRight),
-        (&b.knob_up, Key::KnobUp),
-        (&b.knob_down, Key::KnobDown),
-        (&b.home, Key::Home),
-        (&b.cycle_session, Key::CycleSession),
-        (&b.cluster_layout, Key::ClusterLayout),
-        (&b.cluster_content, Key::ClusterContent),
-        (&b.play_pause, Key::PlayPause),
-        (&b.play, Key::Play),
-        (&b.pause, Key::Pause),
-        (&b.next, Key::Next),
-        (&b.prev, Key::Prev),
-        (&b.accept_phone, Key::AcceptPhone),
-        (&b.reject_phone, Key::RejectPhone),
-        (&b.phone_key0, Key::Phone(t::KEY0)),
-        (&b.phone_key1, Key::Phone(t::KEY0 + 1)),
-        (&b.phone_key2, Key::Phone(t::KEY0 + 2)),
-        (&b.phone_key3, Key::Phone(t::KEY0 + 3)),
-        (&b.phone_key4, Key::Phone(t::KEY0 + 4)),
-        (&b.phone_key5, Key::Phone(t::KEY0 + 5)),
-        (&b.phone_key6, Key::Phone(t::KEY0 + 6)),
-        (&b.phone_key7, Key::Phone(t::KEY0 + 7)),
-        (&b.phone_key8, Key::Phone(t::KEY0 + 8)),
-        (&b.phone_key9, Key::Phone(t::KEY0 + 9)),
-        (&b.phone_key_star, Key::Phone(t::STAR)),
-        (&b.phone_key_hash, Key::Phone(t::POUND)),
-        (&b.phone_key_hook_switch, Key::Phone(t::HOOK_SWITCH)),
-        (&b.voice_assistant, Key::VoiceAssistant),
-        (&b.voice_assistant_release, Key::VoiceAssistantRelease),
-    ];
-    table
+    [
+        ("up", &b.up, Key::Up),
+        ("down", &b.down, Key::Down),
+        ("left", &b.left, Key::Left),
+        ("right", &b.right, Key::Right),
+        ("selectUp", &b.select_up, Key::SelectUp),
+        ("selectDown", &b.select_down, Key::SelectDown),
+        ("back", &b.back, Key::Back),
+        ("knobLeft", &b.knob_left, Key::KnobLeft),
+        ("knobRight", &b.knob_right, Key::KnobRight),
+        ("knobUp", &b.knob_up, Key::KnobUp),
+        ("knobDown", &b.knob_down, Key::KnobDown),
+        ("home", &b.home, Key::Home),
+        ("cycleSession", &b.cycle_session, Key::CycleSession),
+        ("clusterLayout", &b.cluster_layout, Key::ClusterLayout),
+        ("clusterContent", &b.cluster_content, Key::ClusterContent),
+        ("zoomIn", &b.zoom_in, Key::ZoomIn),
+        ("zoomOut", &b.zoom_out, Key::ZoomOut),
+        ("playPause", &b.play_pause, Key::PlayPause),
+        ("play", &b.play, Key::Play),
+        ("pause", &b.pause, Key::Pause),
+        ("next", &b.next, Key::Next),
+        ("prev", &b.prev, Key::Prev),
+        ("acceptPhone", &b.accept_phone, Key::AcceptPhone),
+        ("rejectPhone", &b.reject_phone, Key::RejectPhone),
+        ("phoneKey0", &b.phone_key0, Key::Phone(t::KEY0)),
+        ("phoneKey1", &b.phone_key1, Key::Phone(t::KEY0 + 1)),
+        ("phoneKey2", &b.phone_key2, Key::Phone(t::KEY0 + 2)),
+        ("phoneKey3", &b.phone_key3, Key::Phone(t::KEY0 + 3)),
+        ("phoneKey4", &b.phone_key4, Key::Phone(t::KEY0 + 4)),
+        ("phoneKey5", &b.phone_key5, Key::Phone(t::KEY0 + 5)),
+        ("phoneKey6", &b.phone_key6, Key::Phone(t::KEY0 + 6)),
+        ("phoneKey7", &b.phone_key7, Key::Phone(t::KEY0 + 7)),
+        ("phoneKey8", &b.phone_key8, Key::Phone(t::KEY0 + 8)),
+        ("phoneKey9", &b.phone_key9, Key::Phone(t::KEY0 + 9)),
+        ("phoneKeyStar", &b.phone_key_star, Key::Phone(t::STAR)),
+        ("phoneKeyHash", &b.phone_key_hash, Key::Phone(t::POUND)),
+        (
+            "phoneKeyHookSwitch",
+            &b.phone_key_hook_switch,
+            Key::Phone(t::HOOK_SWITCH),
+        ),
+        ("voiceAssistant", &b.voice_assistant, Key::VoiceAssistant),
+        (
+            "voiceAssistantRelease",
+            &b.voice_assistant_release,
+            Key::VoiceAssistantRelease,
+        ),
+    ]
+}
+
+fn bound(b: &KeyBindings, code: &str) -> Option<Key> {
+    keys(b)
         .into_iter()
-        .find(|(c, _)| !c.is_empty() && c.as_str() == code)
-        .map(|(_, key)| key)
+        .find(|(_, c, _)| !c.is_empty() && c.as_str() == code)
+        .map(|(_, _, key)| key)
+}
+
+fn named(b: &KeyBindings, binding: &str) -> Option<Key> {
+    keys(b)
+        .into_iter()
+        .find(|(name, _, _)| *name == binding)
+        .map(|(_, _, key)| key)
 }
 
 fn reversing(telemetry: &Map<String, Value>) -> Option<bool> {
@@ -361,6 +402,8 @@ pub struct Drivers {
     pub telemetry: mpsc::UnboundedSender<Value>,
     pub settings: mpsc::UnboundedSender<Value>,
     pub themes: PathBuf,
+    pub mfi_chip: PathBuf,
+    pub ui_keys: broadcast::Sender<String>,
 }
 
 pub struct Projection {
@@ -400,13 +443,15 @@ pub struct Projection {
     apply_due: Option<tokio::time::Instant>,
     cluster: Cluster,
     themes: PathBuf,
+    mfi_chip: PathBuf,
+    ui_keys: broadcast::Sender<String>,
     theme_asked: String,
     theme_ready: (mpsc::UnboundedSender<Theme>, mpsc::UnboundedReceiver<Theme>),
     radio: Option<mpsc::UnboundedSender<crate::radio::RadioAsk>>,
     players: players::Players,
     ap_events: Option<mpsc::UnboundedReceiver<ApEvent>>,
     ap_peers: HashMap<u64, ap::ApPeer>,
-    ap_audio: Option<Arc<crate::airplay::ApAudio>>,
+    ap_audio: Option<Arc<crate::projection::airplay::ApAudio>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -426,6 +471,7 @@ pub enum UiCommand {
     ForgetDevice(String),
     CameraFound(bool),
     OpenApp(String),
+    PressKey(String),
 }
 
 fn kept_cluster(cfg: &Config, theme: Theme) -> Cluster {
@@ -449,6 +495,7 @@ pub struct UiAsks {
     pub input_from_compositor: mpsc::UnboundedSender<Input>,
     pub commands_back: mpsc::UnboundedSender<UiCommand>,
     pub ap_ready: watch::Receiver<bool>,
+    pub ui_keys: broadcast::Sender<String>,
 }
 
 pub struct UiSenders {
@@ -463,6 +510,7 @@ pub struct UiSenders {
     pub activity: watch::Receiver<Activity>,
     pub radio: mpsc::UnboundedSender<crate::radio::RadioAsk>,
     pub ap_ready: watch::Sender<bool>,
+    pub ui_keys: broadcast::Sender<String>,
 }
 
 pub struct DongleAsks {
@@ -483,6 +531,7 @@ pub fn ui_channels(wants: PerScreen<Front>) -> (UiSenders, UiAsks, DongleAsks, U
     let (activity_tx, activity_rx) = watch::channel(Activity::default());
     let (radio_tx, radio_rx) = mpsc::unbounded_channel();
     let (ap_ready_tx, ap_ready_rx) = watch::channel(true);
+    let ui_keys = broadcast::channel(8).0;
     let feed = spectrum::Feed::new();
     (
         UiSenders {
@@ -497,6 +546,7 @@ pub fn ui_channels(wants: PerScreen<Front>) -> (UiSenders, UiAsks, DongleAsks, U
             activity: activity_rx,
             radio: radio_tx.clone(),
             ap_ready: ap_ready_tx,
+            ui_keys: ui_keys.clone(),
         },
         UiAsks {
             wants: wants_rx,
@@ -510,6 +560,7 @@ pub fn ui_channels(wants: PerScreen<Front>) -> (UiSenders, UiAsks, DongleAsks, U
             input_from_compositor: input_tx,
             commands_back: commands_tx,
             ap_ready: ap_ready_rx,
+            ui_keys,
         },
         DongleAsks {
             radios: dongle_rx,
@@ -538,6 +589,8 @@ impl Projection {
             telemetry,
             settings,
             themes,
+            mfi_chip,
+            ui_keys,
         } = drivers;
         let cp_telemetry = CpTelemetry::new(devices.helper.clone());
         let cfg = hub.config();
@@ -583,6 +636,8 @@ impl Projection {
             apply_due: None,
             cluster,
             themes,
+            mfi_chip,
+            ui_keys,
             theme_asked: String::new(),
             theme_ready: mpsc::unbounded_channel(),
             radio: None,
@@ -597,7 +652,7 @@ impl Projection {
     pub fn hear_airplay(
         &mut self,
         events: mpsc::UnboundedReceiver<ApEvent>,
-        audio: Arc<crate::airplay::ApAudio>,
+        audio: Arc<crate::projection::airplay::ApAudio>,
     ) {
         self.ap_events = Some(events);
         self.ap_audio = Some(audio);
@@ -613,6 +668,7 @@ impl Projection {
         let mut created = Some(self.plane.player_created());
         let mut host = Some(self.plane.host_events());
         let mut cluster_created = Some(self.clusters.player_created());
+        let mut foreground = foreground().subscribe();
         let mut back = self
             .phone_back
             .take()
@@ -686,6 +742,7 @@ impl Projection {
                     UiCommand::ForgetDevice(id) => self.forget_device(&id),
                     UiCommand::CameraFound(found) => self.camera_found(found),
                     UiCommand::OpenApp(target) => self.open_app(&target),
+                    UiCommand::PressKey(binding) => self.press_named(&binding),
                 },
                 Some(input) = asks.input.recv() => self.input(input),
                 Some(done) = asks.goodbye.recv() => self.goodbye(done),
@@ -712,17 +769,17 @@ impl Projection {
                     Err(broadcast::error::RecvError::Closed) => created = None,
                 },
                 ev = next_of(&mut host) => match ev {
-                    Ok(HostEvent::Started { plane: PLANE_MAIN }) => {
+                    Ok(OutputEvent::Started { plane: PLANE_MAIN }) => {
                         println!("[core] main video: first frame at the decoder");
                         self.main_video_shown();
                     }
-                    Ok(HostEvent::Started { plane: PLANE_AIRPLAY }) => {
+                    Ok(OutputEvent::Started { plane: PLANE_AIRPLAY }) => {
                         println!("[core] airplay video: first frame at the decoder");
                         self.ap_video_shown();
                     }
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("[core] missed {n} gst-host events");
+                        eprintln!("[core] missed {n} output events");
                     }
                     Err(broadcast::error::RecvError::Closed) => host = None,
                 },
@@ -731,6 +788,12 @@ impl Projection {
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => cluster_created = None,
                 },
+                fg = foreground.recv() => {
+                    if fg.is_ok() {
+                        self.plane.refresh();
+                        self.clusters.refresh();
+                    }
+                }
             }
         }
     }

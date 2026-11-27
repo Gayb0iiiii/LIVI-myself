@@ -5,10 +5,12 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use livi_core_proto::PROTOCOL;
+use livi_core_proto::apply;
+use livi_core_proto::config::Config;
 use livi_core_proto::frame::{Decoder, FrameError, encode};
 use livi_core_proto::message::{Action, FromCore, MediaControl, ToCore};
 use serde_json::Value;
@@ -17,19 +19,42 @@ use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, broadcast, oneshot, watch};
 
-use crate::config_file::{ConfigFile, apply_patch};
+use crate::audio::spectrum::Viewer;
 use crate::devices::Shared;
 use crate::dongle::LinkSpeedViewer;
+use crate::files::config_file::ConfigFile;
+use crate::files::status_file::Activity;
 use crate::hub::{Frame, Hub};
 use crate::projection::{UiCommand, UiSenders};
 use crate::radio::{Band, RadioAsk, Station};
-use crate::spectrum::Viewer;
-use crate::status_file::Activity;
 use crate::update::UpdateAsk;
+
+/// Sliders send every 100 ms, each NOR flash save takes longer and wears it.
+const SAVE_QUIET: Duration = Duration::from_millis(500);
+
+struct ConfigSaves {
+    file: ConfigFile,
+    wanted: AtomicU64,
+    on_disk: std::sync::Mutex<Config>,
+}
+
+impl ConfigSaves {
+    fn write(&self, hub: &Hub) {
+        let next = apply::saved(&hub.config(), &hub.applied_config());
+        let mut on_disk = self.on_disk.lock().unwrap_or_else(|e| e.into_inner());
+        if *on_disk == next {
+            return;
+        }
+        match self.file.save(&next) {
+            Ok(()) => *on_disk = next,
+            Err(e) => eprintln!("[core] config not saved: {e}"),
+        }
+    }
+}
 
 pub struct Core {
     pub hub: Arc<Hub>,
-    config_file: ConfigFile,
+    config_saves: Arc<ConfigSaves>,
     config_writes: Mutex<()>,
     pub quit: Arc<Notify>,
     pub restart: AtomicBool,
@@ -51,9 +76,14 @@ impl Core {
         quit: Arc<Notify>,
         asks: UiSenders,
     ) -> Self {
+        let on_disk = std::sync::Mutex::new(hub.config());
         Self {
             hub: Arc::new(hub),
-            config_file,
+            config_saves: Arc::new(ConfigSaves {
+                file: config_file,
+                wanted: AtomicU64::new(0),
+                on_disk,
+            }),
             config_writes: Mutex::new(()),
             quit,
             restart: AtomicBool::new(false),
@@ -86,10 +116,20 @@ impl Core {
         let _ = self.asks.commands.send(UiCommand::OpenApp(target));
     }
 
+    pub fn press_key(&self, binding: String) {
+        let _ = self.asks.commands.send(UiCommand::PressKey(binding));
+    }
+
     pub async fn refresh_mfi(&self) -> Result<(), String> {
         let view = crate::mfi::read(&self.mfi_dir);
         let files = crate::mfi::digest(&self.mfi_dir);
-        self.hub.update(|s| s.mfi = view);
+        self.hub.update(|s| {
+            s.mfi = livi_core_proto::state::Mfi {
+                probed: s.mfi.probed,
+                chip: s.mfi.chip.take(),
+                ..view
+            }
+        });
         if self.hub.config().car_play_mfi_files == files {
             return Ok(());
         }
@@ -99,12 +139,28 @@ impl Core {
 
     pub async fn set_config(&self, patch: &Value) -> Result<(), String> {
         let _one_at_a_time = self.config_writes.lock().await;
-        let next = apply_patch(&self.hub.config(), patch)?;
-        self.config_file
-            .save(&next)
-            .map_err(|e| format!("not saved: {e}"))?;
+        let next = self.config_saves.file.patch(&self.hub.config(), patch)?;
         self.hub.update(|s| s.config = next);
+        let wanted = self.config_saves.wanted.fetch_add(1, Ordering::SeqCst) + 1;
+        let (saves, hub) = (self.config_saves.clone(), self.hub.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(SAVE_QUIET).await;
+            if saves.wanted.load(Ordering::SeqCst) == wanted {
+                saves.write(&hub);
+            }
+        });
         Ok(())
+    }
+
+    pub fn flush_config(&self) {
+        self.config_saves.write(&self.hub);
+    }
+
+    pub async fn save_on_apply(self: Arc<Self>) {
+        let mut applied = self.hub.applied();
+        while applied.changed().await.is_ok() {
+            self.config_saves.write(&self.hub);
+        }
     }
 
     pub fn activity(&self) -> watch::Receiver<Activity> {
@@ -118,6 +174,7 @@ impl Core {
             .map_err(|_| "updates are not available".to_string())
     }
 
+    #[cfg(feature = "net")]
     pub fn relaunch(&self, program: PathBuf) {
         *self.relaunch.lock().unwrap_or_else(|e| e.into_inner()) = Some(program);
         self.restart.store(true, Ordering::SeqCst);
@@ -391,6 +448,7 @@ async fn client(core: Arc<Core>, stream: UnixStream) -> io::Result<()> {
     }
     println!("[core] {client} connected");
     let mut pages = core.open_page.subscribe();
+    let mut keys = core.asks.ui_keys.subscribe();
     let mut patches = welcome(&core, &mut wr).await?;
     let mut viewer: Option<Viewer> = None;
     let mut link_speed_viewer: Option<LinkSpeedViewer> = None;
@@ -443,6 +501,11 @@ async fn client(core: Arc<Core>, stream: UnixStream) -> io::Result<()> {
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => break,
             },
+            key = keys.recv() => match key {
+                Ok(name) => send(&mut wr, &FromCore::Key { name }).await?,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
         }
     }
     println!("[core] {client} disconnected");
@@ -456,9 +519,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config_file::defaults;
+    use crate::files::config_file::defaults;
 
-    use crate::config_file::tests::TempDir;
+    use crate::files::config_file::tests::TempDir;
 
     struct Peer {
         stream: UnixStream,
@@ -533,6 +596,7 @@ mod tests {
             front: livi,
             sessions: Default::default(),
             now_playing: Default::default(),
+            audio: None,
             video_playback: None,
             telemetry: Default::default(),
             navigation: Default::default(),
@@ -813,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn a_config_change_reaches_every_client_and_the_file() {
         let dir = TempDir::new();
-        let (_core, path) = start(&dir);
+        let (core, path) = start(&dir);
         let mut ui = Peer::hello(&path).await;
         let mut dash = Peer::hello(&path).await;
 
@@ -836,10 +900,35 @@ mod tests {
         assert!([&first, &second].contains(&&FromCore::Reply { id: 1, error: None }));
         assert_eq!(dash.recv().await, Some(patch));
 
+        core.flush_config();
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.0.join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(saved["huVolume"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn a_setting_that_waits_for_apply_is_saved_once_applied() {
+        use crate::files::config_file::HostFacts;
+
+        let dir = TempDir::new();
+        let (core, _path) = start(&dir);
+        let on_disk = || {
+            ConfigFile::new(dir.0.join("config.json"), dir.0.join("backup.json")).load(&HostFacts {
+                car_name: None,
+                panel: None,
+            })
+        };
+        core.set_config(&json!({ "huVolume": 0.5, "screenWidthMm": { "main": 344 } }))
+            .await
+            .unwrap();
+        core.flush_config();
+        assert_eq!(on_disk().hu_volume, 0.5);
+        assert_eq!(on_disk().screen_width_mm.main, 0);
+
+        core.hub.apply(core.hub.config());
+        core.flush_config();
+        assert_eq!(on_disk().screen_width_mm.main, 344);
     }
 
     #[tokio::test]

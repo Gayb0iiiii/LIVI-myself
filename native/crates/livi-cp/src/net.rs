@@ -6,24 +6,29 @@ use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use socket2::{Domain, Protocol, Socket, Type};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-fn any(kind: Type, proto: Protocol) -> io::Result<Socket> {
+fn any(kind: Type, proto: Protocol, port: u16) -> io::Result<Socket> {
     let sock = Socket::new(Domain::IPV6, kind, Some(proto))?;
     sock.set_only_v6(false)?;
     sock.set_nonblocking(true)?;
-    sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())?;
+    sock.bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())?;
     Ok(sock)
 }
 
 pub fn tcp_listener() -> io::Result<TcpListener> {
-    let sock = any(Type::STREAM, Protocol::TCP)?;
+    let sock = any(Type::STREAM, Protocol::TCP, 0)?;
     sock.listen(16)?;
     TcpListener::from_std(sock.into())
 }
 
 pub fn udp_socket() -> io::Result<UdpSocket> {
-    UdpSocket::from_std(any(Type::DGRAM, Protocol::UDP)?.into())
+    udp_socket_at(0)
+}
+
+pub fn udp_socket_at(port: u16) -> io::Result<UdpSocket> {
+    UdpSocket::from_std(any(Type::DGRAM, Protocol::UDP, port)?.into())
 }
 
 pub fn v6(addr: SocketAddr) -> SocketAddr {
@@ -63,6 +68,27 @@ pub fn route_of(addr: &SocketAddr) -> String {
             format!("{}%{}", a.ip(), a.scope_id())
         }
         _ => host_of(addr),
+    }
+}
+
+pub(crate) async fn read_head<S: AsyncRead + Unpin>(
+    sock: &mut S,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<usize> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok(end);
+        }
+        if buf.len() > max {
+            return Err(io::Error::other("a head without end"));
+        }
+        let n = sock.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
 }
 

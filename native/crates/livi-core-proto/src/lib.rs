@@ -3,6 +3,7 @@
 // Additional terms: see NOTICE
 
 pub mod aa_events;
+pub mod apply;
 pub mod config;
 pub mod features;
 pub mod frame;
@@ -14,6 +15,7 @@ pub mod icon;
 pub mod ids;
 pub mod input;
 pub mod message;
+pub mod module;
 pub mod patch;
 pub mod runtime;
 pub mod state;

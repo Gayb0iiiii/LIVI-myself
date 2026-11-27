@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use livi_host_proto::{UrlStatus, VideoCodec};
+use livi_output_proto::{UrlStatus, VideoCodec};
 
 use crate::Say;
 
@@ -205,16 +205,18 @@ fn prefer_our_decoders() {
 }
 
 pub(crate) fn video_sink(say: &Say) -> Option<gst::Element> {
-    if cfg!(any(target_os = "macos", target_os = "android")) {
+    if cfg!(any(target_vendor = "apple", target_os = "android")) {
         return gst::ElementFactory::make("glimagesink")
             .build()
             .inspect_err(|e| say(&format!("[gst_video] no glimagesink: {e}")))
             .ok();
     }
-    let desc = std::env::var("LIVI_GST_SINK")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "waylandsink".to_owned());
+    let desc = livi_video::codec::sink_override().unwrap_or_else(|| {
+        format!(
+            "videoconvert n-threads=0 ! {}",
+            livi_video::codec::desktop_sink(None)
+        )
+    });
     gst::parse::bin_from_description(&desc, true)
         .inspect_err(|e| say(&format!("[gst_video] no video sink {desc}: {e}")))
         .ok()
@@ -222,13 +224,7 @@ pub(crate) fn video_sink(say: &Say) -> Option<gst::Element> {
 }
 
 fn audio_sink(device: &str) -> Option<gst::Element> {
-    let (element, device_property) = if cfg!(target_os = "macos") {
-        ("osxaudiosink", "unique-id")
-    } else if cfg!(target_os = "android") {
-        ("aaudiosink", "device")
-    } else {
-        ("pulsesink", "device")
-    };
+    let (element, device_property) = livi_output_proto::audio::audio_sink();
     let sink = gst::ElementFactory::make(element).build().ok()?;
     if !device.is_empty() {
         sink.set_property(device_property, device);

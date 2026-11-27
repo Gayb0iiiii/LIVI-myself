@@ -74,7 +74,7 @@ fn command(cmd: &UiCmd, core_socket: &Path, ui: Option<&Ui>) -> Command {
             None => c.env_remove("LIVI_RENDER_NODE"),
         };
     }
-    crate::child::with_lifeline(&mut c)
+    crate::system::child::with_lifeline(&mut c)
         .process_group(0)
         .kill_on_drop(true);
     c
@@ -110,11 +110,11 @@ async fn run(
             }
         };
         println!("[core] UI started");
-        let _lifeline = crate::child::hold_lifeline(&mut child);
+        let _lifeline = crate::system::child::hold_lifeline(&mut child);
         let status = tokio::select! {
             status = child.wait() => status,
             _ = stop.changed() => {
-                crate::child::terminate(&mut child, STOP_GRACE, true).await;
+                crate::system::child::terminate(&mut child, STOP_GRACE, true).await;
                 return;
             }
         };
@@ -126,7 +126,14 @@ async fn run(
             }
             other => eprintln!("[core] UI exited: {other:?}"),
         }
-        if started.elapsed() >= STABLE_AFTER {
+        let held = Path::new(livi_base::lfwb::HOLD).exists();
+        while Path::new(livi_base::lfwb::HOLD).exists() {
+            tokio::select! {
+                _ = tokio::time::sleep(restart_delay) => {}
+                _ = stop.changed() => return,
+            }
+        }
+        if held || started.elapsed() >= STABLE_AFTER {
             restarts = 0;
         }
         restarts += 1;

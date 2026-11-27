@@ -129,6 +129,7 @@ pub(super) fn row_data(r: &Row, focus_at: i32) -> RowData {
 pub(super) fn custom_name(page: CustomPage) -> &'static str {
     match page {
         CustomPage::About => "About",
+        CustomPage::AudioInfo => "Audio info",
         CustomPage::CarReadings => "Car readings",
         CustomPage::ColorCalibration => "Color calibration",
         CustomPage::ContrastGammaCalibration => "Contrast / Gamma",
@@ -163,11 +164,15 @@ pub(super) fn show_color(s: &SettingsState, hsl: Hsl, c: [u8; 3], custom: bool) 
 }
 
 pub(super) fn render_screen(c: &mut Controller, s: &SettingsState, state: &Value) {
-    if c.model.screen(&c.stack, state, &c.strings).is_none() {
-        c.stack.clear();
-    }
-    let Some(screen) = c.model.screen(&c.stack, state, &c.strings) else {
-        return;
+    let screen = match c.model.screen(&c.stack, state, &c.strings) {
+        Some(screen) => screen,
+        None => {
+            c.stack.clear();
+            let Some(screen) = c.model.screen(&c.stack, state, &c.strings) else {
+                return;
+            };
+            screen
+        }
     };
     let screen = match &c.browser {
         Some(b) => Screen::List {
@@ -178,15 +183,7 @@ pub(super) fn render_screen(c: &mut Controller, s: &SettingsState, state: &Value
         None => screen,
     };
     s.set_can_back(!c.stack.is_empty() || c.browser.is_some());
-    let open = sessions_open(state);
-    if !open || c.baseline.is_none() {
-        c.baseline = Some(state["config"].clone());
-    }
-    let waiting = c
-        .baseline
-        .as_ref()
-        .is_some_and(|b| pending(&state["config"], b));
-    s.set_show_apply(open && waiting);
+    s.set_show_apply(state["system"]["applyPending"].as_bool().unwrap_or(false));
     s.set_apply_text(c.strings.t("settings.apply", "Apply").into());
     s.set_hue_label(c.strings.t("settings.colorHue", "Hue").into());
     s.set_saturation_label(c.strings.t("settings.colorSaturation", "Saturation").into());
@@ -215,29 +212,27 @@ pub(super) fn render_screen(c: &mut Controller, s: &SettingsState, state: &Value
                     row_data(r, at)
                 })
                 .collect();
-            s.set_focus_rows(ModelRc::from(Rc::new(VecModel::from(focus_rows))));
+            if let Some(fresh) = refill(&s.get_focus_rows(), focus_rows) {
+                s.set_focus_rows(fresh);
+            }
             if let Some(fresh) = refill(&s.get_rows(), data) {
                 s.set_rows(fresh);
             }
             c.rows = rows;
             s.set_kind(ScreenKind::List);
         }
-        Screen::Select {
-            title,
-            options,
-            read_only,
-        } => {
+        Screen::Select { title, options } => {
             s.set_title(title.into());
-            s.set_read_only(read_only);
-            s.set_picks(ModelRc::from(Rc::new(VecModel::from(
-                options
-                    .into_iter()
-                    .map(|p| PickData {
-                        label: p.label.into(),
-                        selected: p.selected,
-                    })
-                    .collect::<Vec<_>>(),
-            ))));
+            let picks = options
+                .into_iter()
+                .map(|p| PickData {
+                    label: p.label.into(),
+                    selected: p.selected,
+                })
+                .collect();
+            if let Some(fresh) = refill(&s.get_picks(), picks) {
+                s.set_picks(fresh);
+            }
             s.set_kind(ScreenKind::Select);
         }
         Screen::Number {

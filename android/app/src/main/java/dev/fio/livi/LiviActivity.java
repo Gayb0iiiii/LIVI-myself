@@ -15,6 +15,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageInstaller;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -33,6 +34,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.FrameLayout;
 import java.io.File;
 import java.io.FileInputStream;
@@ -58,13 +60,17 @@ public class LiviActivity extends NativeActivity {
     private final SparseArray<SurfaceView> planes = new SparseArray<>();
     private final AtomicInteger lastPlane = new AtomicInteger();
     private FrameLayout stage;
+    private volatile boolean kiosk;
+    private LiviMedia mediaSession;
 
     static {
         System.loadLibrary("gstreamer_android");
         System.loadLibrary("livi");
     }
 
-    private static native void key(int scancode, boolean down, boolean repeat);
+    private static native void key(int keycode, int scancode, int typed, boolean down, boolean repeat);
+
+    static native void media(int control);
 
     private static native void surface(int plane, Surface surface);
 
@@ -92,6 +98,7 @@ public class LiviActivity extends NativeActivity {
         bluetoothAddress(LiviBluetooth.address(this));
         super.onCreate(state);
         getWindow().setFormat(PixelFormat.TRANSLUCENT);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         List<String> wanted = new ArrayList<>(Arrays.asList(LiviBluetooth.PERMISSIONS));
         wanted.addAll(Arrays.asList(LiviHotspot.PERMISSIONS));
         wanted.add(Manifest.permission.RECORD_AUDIO);
@@ -104,6 +111,15 @@ public class LiviActivity extends NativeActivity {
         });
         addContentView(stage, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        mediaSession = new LiviMedia(this);
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (mediaSession != null) {
+            mediaSession.release();
+        }
+        super.onDestroy();
     }
 
     private int plane(int rank) {
@@ -218,23 +234,65 @@ public class LiviActivity extends NativeActivity {
     }
 
     private void kiosk(boolean on) {
+        kiosk = on;
+        runOnUiThread(this::applyKiosk);
+    }
+
+    private void mediaState(boolean playing) {
         runOnUiThread(() -> {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                getWindow().getDecorView().setSystemUiVisibility(on
-                        ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                                | View.SYSTEM_UI_FLAG_FULLSCREEN
-                                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                        : 0);
-                return;
-            }
-            WindowInsetsController bars = getWindow().getInsetsController();
-            bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-            if (on) {
-                bars.hide(WindowInsets.Type.systemBars());
-            } else {
-                bars.show(WindowInsets.Type.systemBars());
+            if (mediaSession != null) {
+                mediaSession.setPlaying(playing);
             }
         });
+    }
+
+    private void nowPlaying(String title, String artist, String album, long durationMs, byte[] art, int width, int height) {
+        runOnUiThread(() -> {
+            if (mediaSession != null) {
+                mediaSession.setMetadata(title, artist, album, durationMs, art, width, height);
+            }
+        });
+    }
+
+    private float volume() {
+        AudioManager audio = getSystemService(AudioManager.class);
+        int max = audio == null ? 0 : audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        return max > 0 ? (float) audio.getStreamVolume(AudioManager.STREAM_MUSIC) / max : -1f;
+    }
+
+    private void setVolume(float level) {
+        AudioManager audio = getSystemService(AudioManager.class);
+        if (audio != null) {
+            int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(level * max), 0);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && kiosk) {
+            applyKiosk();
+        }
+    }
+
+    private void applyKiosk() {
+        boolean on = kiosk;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            getWindow().getDecorView().setSystemUiVisibility(on
+                    ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                            | View.SYSTEM_UI_FLAG_FULLSCREEN
+                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    : 0);
+            return;
+        }
+        WindowInsetsController bars = getWindow().getInsetsController();
+        bars.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        if (on) {
+            bars.hide(WindowInsets.Type.systemBars());
+        } else {
+            bars.show(WindowInsets.Type.systemBars());
+        }
     }
 
     private void exit(boolean restart) {
@@ -298,11 +356,21 @@ public class LiviActivity extends NativeActivity {
     }
 
     private void pick() {
-        runOnUiThread(() -> startActivityForResult(
-                new Intent(Intent.ACTION_OPEN_DOCUMENT)
-                        .addCategory(Intent.CATEGORY_OPENABLE)
-                        .setType("*/*"),
-                PICK_REQUEST));
+        runOnUiThread(() -> {
+            if (!open(Intent.ACTION_OPEN_DOCUMENT) && !open(Intent.ACTION_GET_CONTENT)) {
+                Log.w("livi", "[pick] no file picker installed");
+            }
+        });
+    }
+
+    private boolean open(String action) {
+        try {
+            startActivityForResult(
+                    new Intent(action).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), PICK_REQUEST);
+            return true;
+        } catch (ActivityNotFoundException e) {
+            return false;
+        }
     }
 
     @Override
@@ -375,7 +443,12 @@ public class LiviActivity extends NativeActivity {
                 || (action != KeyEvent.ACTION_DOWN && action != KeyEvent.ACTION_UP)) {
             return super.dispatchKeyEvent(event);
         }
-        key(event.getScanCode(), action == KeyEvent.ACTION_DOWN, event.getRepeatCount() > 0);
+        key(
+                event.getKeyCode(),
+                event.getScanCode(),
+                event.getUnicodeChar(),
+                action == KeyEvent.ACTION_DOWN,
+                event.getRepeatCount() > 0);
         return true;
     }
 }

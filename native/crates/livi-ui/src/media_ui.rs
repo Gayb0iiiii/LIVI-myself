@@ -11,7 +11,7 @@ use livi_core_proto::message::{Action, MediaControl};
 use livi_ui_model::media::{Guess, Playback, Pressed, Station};
 use slint::{Color, ComponentHandle, Image, Model, ModelRc, Timer, TimerMode, VecModel};
 
-use crate::media::{MediaView, RadioView, Radios};
+use crate::media::{EMPTY, MediaView, Pixels, RadioView, Radios};
 use crate::{AppWindow, DabState, MediaSource, MediaText, Page, Press, StationData};
 
 const UI_INTERVAL: Duration = Duration::from_millis(120);
@@ -25,11 +25,14 @@ struct Live {
     duration_ms: f64,
     radios: Option<Radios>,
     on_air: Option<MediaSource>,
+    media_playing: Option<bool>,
     radio_playing: bool,
     radio_guess: Guess,
     tuned: Option<(u32, bool)>,
     picked: Option<(u32, Instant)>,
     rows: Option<Rows>,
+    meta: Option<(String, String, String, f64)>,
+    art: Option<Pixels>,
 }
 
 struct Rows {
@@ -49,22 +52,31 @@ fn rgb([r, g, b]: [u8; 3]) -> Color {
 
 fn tick(ui: &AppWindow) {
     let now = Instant::now();
-    let keep = LIVE.with_borrow_mut(|l| {
+    let (keep, emit) = LIVE.with_borrow_mut(|l| {
         let shown = l.playback.tick(now);
         ui.set_progress(shown.progress);
         ui.set_elapsed_ms(shown.elapsed_ms as f32);
         ui.set_playing(shown.playing);
-        ui.global::<DabState>()
-            .set_playing(l.radio_guess.shown(l.radio_playing, now));
+        let radio_playing = l.radio_guess.shown(l.radio_playing, now);
+        ui.global::<DabState>().set_playing(radio_playing);
         if l.picked.is_some_and(|(_, until)| now >= until) {
             l.picked = None;
             ui.global::<DabState>().set_picked(-1);
         }
-        l.playback.running()
+        let playing = shown.playing || radio_playing;
+        let emit = (l.media_playing != Some(playing)).then(|| {
+            l.media_playing = Some(playing);
+            playing
+        });
+        let keep = l.playback.running()
             || l.playback.guessing(now)
             || l.radio_guess.pending(now)
-            || l.picked.is_some()
+            || l.picked.is_some();
+        (keep, emit)
     });
+    if let Some(playing) = emit {
+        crate::media_state(playing);
+    }
     let wanted =
         keep && (ui.get_page() == Page::Media || ui.get_video_shown() || ui.get_mirrored());
     TICK.with(|t| match (wanted, t.running()) {
@@ -86,22 +98,44 @@ pub fn follow(ui: &AppWindow) {
 }
 
 pub fn apply_media(ui: &AppWindow, client: Option<&Client>, mut m: MediaView) {
+    let plain = |s: &str| {
+        if s == EMPTY {
+            String::new()
+        } else {
+            s.to_owned()
+        }
+    };
+    let meta = (
+        plain(&m.title),
+        plain(&m.artist),
+        m.album.clone(),
+        m.duration_ms,
+    );
     ui.set_track_title(m.title.into());
     ui.set_artist(m.artist.into());
     ui.set_album(m.album.into());
     ui.set_app(m.app.into());
     ui.set_can_seek(m.can_seek);
     ui.set_total_ms(m.duration_ms as f32);
-    match m.artwork.take() {
+    let artwork = m.artwork.take();
+    match &artwork {
         Some(Some(buf)) => {
-            ui.set_artwork(Image::from_rgba8(buf));
+            ui.set_artwork(Image::from_rgba8(buf.clone()));
             ui.set_has_artwork(true);
         }
         Some(None) => ui.set_has_artwork(false),
         None => {}
     }
     let track = format!("{}\u{1f}{}", ui.get_track_title(), ui.get_artist());
-    let new_session = LIVE.with_borrow_mut(|l| {
+    let (new_session, now) = LIVE.with_borrow_mut(|l| {
+        let fresh = artwork.is_some() || l.meta.as_ref() != Some(&meta);
+        if let Some(art) = artwork {
+            l.art = art;
+        }
+        let now = fresh.then(|| {
+            l.meta = Some(meta.clone());
+            l.art.clone()
+        });
         let changed = l.session.as_ref().is_some_and(|s| *s != m.session);
         l.session = Some(m.session);
         l.duration_ms = m.duration_ms;
@@ -115,8 +149,17 @@ pub fn apply_media(ui: &AppWindow, client: Option<&Client>, mut m: MediaView) {
             m.playing,
             Instant::now(),
         );
-        changed
+        (changed, now)
     });
+    if let Some(art) = now {
+        crate::now_playing(&crate::NowPlaying {
+            title: &meta.0,
+            artist: &meta.1,
+            album: &meta.2,
+            duration_ms: meta.3,
+            artwork: art.as_ref().map(|p| (p.as_bytes(), p.width(), p.height())),
+        });
+    }
     if new_session && ui.get_show_spectrum() {
         ui.set_show_spectrum(false);
         if let Some(c) = client {
@@ -348,6 +391,22 @@ pub fn pressed_feedback(ui: &AppWindow, which: Pressed) {
     tick(ui);
 }
 
+pub(crate) fn act(ui: &AppWindow, client: &Client, which: Pressed, control: MediaControl) {
+    pressed_feedback(ui, which);
+    let d = ui.global::<DabState>();
+    let view = d.get_view();
+    if !d.get_receiver() || view == MediaSource::Phone {
+        client.act(Action::PhoneMedia { control });
+        return;
+    }
+    let idle = LIVE.with_borrow(|l| l.on_air != Some(view));
+    match view {
+        MediaSource::Dab if idle => client.act(Action::DabResume),
+        MediaSource::Fm if idle => client.act(Action::FmResume),
+        _ => client.act(Action::Media { control }),
+    }
+}
+
 pub fn wire(ui: &AppWindow, client: &Client) {
     let weak = ui.as_weak();
     let button = |which: Pressed, control: MediaControl| {
@@ -355,19 +414,7 @@ pub fn wire(ui: &AppWindow, client: &Client) {
         let weak = weak.clone();
         move || {
             let Some(ui) = weak.upgrade() else { return };
-            pressed_feedback(&ui, which);
-            let d = ui.global::<DabState>();
-            let view = d.get_view();
-            if !d.get_receiver() || view == MediaSource::Phone {
-                c.act(Action::PhoneMedia { control });
-                return;
-            }
-            let idle = LIVE.with_borrow(|l| l.on_air != Some(view));
-            match view {
-                MediaSource::Dab if idle => c.act(Action::DabResume),
-                MediaSource::Fm if idle => c.act(Action::FmResume),
-                _ => c.act(Action::Media { control }),
-            }
+            act(&ui, &c, which, control);
         }
     };
     ui.on_play_pause(button(Pressed::Play, MediaControl::PlayPause));

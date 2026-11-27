@@ -14,8 +14,8 @@ use livi_link_host::link::CHOICE;
 use tokio::sync::watch;
 
 use crate::hub::Hub;
-use crate::hwaddr;
 use crate::projection::DongleAsks;
+use crate::system::hwaddr;
 
 const POLL: Duration = Duration::from_millis(1500);
 const RATES_EVERY: Duration = Duration::from_secs(5);
@@ -134,7 +134,7 @@ fn attached() -> bool {
 }
 
 async fn talk(commands: Vec<String>) -> Result<Status, String> {
-    tokio::task::spawn_blocking(move || ap::talk(&commands, APPLY))
+    tokio::task::spawn_blocking(move || ap::talk(&commands, APPLY).map_err(|e| e.to_string()))
         .await
         .unwrap_or_else(|e| Err(e.to_string()))
 }
@@ -307,6 +307,7 @@ impl Link {
             bt_adapters.push(CHOICE.into());
         }
         hub.update(|s| {
+            s.system.mfi_on_board = livi_core_proto::helper::board_mfi();
             s.system.wifi_interfaces = wifi_interfaces;
             s.system.bt_adapters = bt_adapters;
             s.system.interface_models = models;
@@ -393,7 +394,7 @@ pub async fn run(hub: Arc<Hub>, mut asks: DongleAsks) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_file::defaults;
+    use crate::files::config_file::defaults;
 
     fn status(pairs: &[(&str, &str)]) -> Status {
         pairs

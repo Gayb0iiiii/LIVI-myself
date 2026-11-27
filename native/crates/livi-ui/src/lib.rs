@@ -2,19 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
+#[cfg(not(in_process))]
+mod app;
+#[cfg(not(in_process))]
+mod bundle;
 pub mod clock;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(in_process))]
+mod core_process;
+#[cfg(winit)]
 mod cursor_ui;
 mod dashboard_ui;
 #[cfg(target_os = "macos")]
 mod dock_ui;
+#[cfg(kms)]
+mod evdev;
 mod files_ui;
 mod follow;
 mod fonts;
 mod fullscreen;
 mod icon_ui;
 mod icons;
+mod keyboard_ui;
 mod keys_ui;
+#[cfg(not(in_process))]
+mod log;
 mod media;
 mod media_ui;
 mod overlay_ui;
@@ -24,6 +35,9 @@ mod settings_ui;
 mod shape_ui;
 mod touch_ui;
 mod video_ui;
+
+#[cfg(not(in_process))]
+pub use app::main;
 
 use std::cell::{Cell, RefCell};
 use std::os::unix::net::UnixStream;
@@ -39,20 +53,25 @@ use slint::platform::WindowEvent;
 use slint::{Color, Model, ModelRc, Timer, TimerMode, VecModel, Weak};
 
 use crate::follow::{Follow, Update};
-use livi_ui_model::shell::{Look, Tab, ui_scale};
+use livi_ui_model::shell::{Look, Tab, dpi_scale, ui_scale};
 
 slint::include_modules!();
 
 type Kiosk = Box<dyn Fn(bool)>;
 type Pick = Box<dyn Fn()>;
+type MediaSink = Box<dyn Fn(bool)>;
+type NowSink = Box<dyn Fn(&NowPlaying)>;
 
 thread_local! {
     static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
     static MAIN: RefCell<Option<Weak<AppWindow>>> = const { RefCell::new(None) };
     static KIOSK: RefCell<Option<Kiosk>> = const { RefCell::new(None) };
+    static MEDIA_SINK: RefCell<Option<MediaSink>> = const { RefCell::new(None) };
+    static NOW_SINK: RefCell<Option<NowSink>> = const { RefCell::new(None) };
     static PICK: RefCell<Option<Pick>> = const { RefCell::new(None) };
     static BASE_SCALE: Cell<Option<f32>> = const { Cell::new(None) };
     static ZOOM: Cell<f32> = const { Cell::new(1.0) };
+    static SCREEN_MM: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
 }
 
 const BANDS: usize = 24;
@@ -75,6 +94,14 @@ pub(crate) fn apply_zoom(ui: &AppWindow) {
     let Some(base) = BASE_SCALE.get() else { return };
     let window = ui.window();
     let physical = window.size();
+    let base = if (base - 1.0).abs() < 0.01 {
+        dpi_scale(
+            (physical.width as f32, physical.height as f32),
+            SCREEN_MM.get(),
+        )
+    } else {
+        base
+    };
     let scale = ui_scale(base, ZOOM.get(), physical.height as f32);
     if (window.scale_factor() - scale).abs() < 0.001 {
         return;
@@ -87,7 +114,24 @@ pub(crate) fn apply_zoom(ui: &AppWindow) {
     });
 }
 
-#[cfg(not(target_os = "android"))]
+fn rendering_set_up(ui: &AppWindow) {
+    if !attach_video(ui.window(), "main") {
+        eprintln!("[ui] the window has no native handle for the video");
+    }
+    #[cfg(winit)]
+    cursor_ui::start(ui);
+    if BASE_SCALE.get().is_none() {
+        BASE_SCALE.set(Some(ui.window().scale_factor()));
+        let weak = ui.as_weak();
+        Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = weak.upgrade() {
+                apply_zoom(&ui);
+            }
+        });
+    }
+}
+
+#[cfg(winit)]
 pub(crate) fn system_scale_changed(ui: &AppWindow, scale: f32) {
     BASE_SCALE.set(Some(scale));
     let weak = ui.as_weak();
@@ -138,6 +182,7 @@ fn apply_look(ui: &AppWindow, look: Look) {
     apply_language(ui, &look.language);
     if ZOOM.get() != look.zoom {
         ZOOM.set(look.zoom);
+        ui.global::<Ui>().set_zoom(look.zoom);
         apply_zoom(ui);
     }
 }
@@ -193,6 +238,10 @@ fn apply(ui: &AppWindow, update: Update) {
             settle_projection_focus(ui);
         }
         Update::Look(look) => apply_look(ui, look),
+        Update::ScreenMm(mm) => {
+            SCREEN_MM.set(mm);
+            apply_zoom(ui);
+        }
         #[cfg(target_os = "macos")]
         Update::Shape(w, h) => shape_ui::follow(ui, w, h),
         Update::Kiosk(on) => {
@@ -213,6 +262,11 @@ fn apply(ui: &AppWindow, update: Update) {
             }
         }
         Update::Open(path) => open_path(ui, &path),
+        Update::Key(name) => CLIENT.with_borrow(|c| {
+            if let Some(c) = c {
+                keys_ui::from_core(ui, c, &name);
+            }
+        }),
         Update::Volume(level) => overlay_ui::volume(ui, level),
         Update::PhoneName(name) => overlay_ui::phone(ui, &name),
         Update::Camera(found) => ui.set_camera_found(found),
@@ -346,7 +400,17 @@ pub(crate) fn attach_video(window: &slint::Window, screen: &str) -> bool {
         }
         false
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(kms)]
+    {
+        use std::os::fd::AsRawFd;
+        let _ = window;
+        let Some(fd) = i_slint_backend_linuxkms::drm_device() else {
+            return false;
+        };
+        livi_video_view::set_window(screen, fd.as_raw_fd() as usize);
+        true
+    }
+    #[cfg(not(ui_video))]
     {
         let _ = (window, screen);
         true
@@ -354,9 +418,9 @@ pub(crate) fn attach_video(window: &slint::Window, screen: &str) -> bool {
 }
 
 pub(crate) fn detach_video(screen: &str) {
-    #[cfg(target_os = "macos")]
+    #[cfg(ui_video)]
     livi_video_view::set_window(screen, 0);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(ui_video))]
     let _ = screen;
 }
 
@@ -372,6 +436,7 @@ fn follow_core(weak: Weak<AppWindow>) -> impl FnMut(Event, &Mutex<Mirror>) + Sen
             Event::Changed(keys) => follow.changed(Some(&keys), &read().state),
             Event::Spectrum(bands) => vec![Update::Spectrum(bands)],
             Event::OpenPage(path) => vec![Update::Open(path)],
+            Event::Key(name) => vec![Update::Key(name)],
             Event::Gone(why) => {
                 eprintln!("[ui] core gone: {why}");
                 return;
@@ -438,14 +503,90 @@ fn wire(ui: &AppWindow, client: &Client) {
     dashboard_ui::wire(&ui.global::<DashState>(), client);
 }
 
-pub fn key(code: &str, down: bool, repeat: bool) {
+pub fn key(code: &str, printed: Option<&str>, down: bool, repeat: bool) {
     let Some(ui) = MAIN.with_borrow(|m| m.as_ref().and_then(Weak::upgrade)) else {
         return;
     };
     CLIENT.with_borrow(|c| {
         if let Some(c) = c {
-            keys_ui::key(&ui, c, code, down, repeat);
+            keys_ui::key(&ui, c, code, printed, down, repeat);
         }
+    });
+}
+
+pub fn set_media_sink(sink: impl Fn(bool) + 'static) {
+    MEDIA_SINK.with_borrow_mut(|s| *s = Some(Box::new(sink)));
+}
+
+pub(crate) fn media_state(playing: bool) {
+    MEDIA_SINK.with_borrow(|s| {
+        if let Some(s) = s {
+            s(playing);
+        }
+    });
+}
+
+pub struct NowPlaying<'a> {
+    pub title: &'a str,
+    pub artist: &'a str,
+    pub album: &'a str,
+    pub duration_ms: f64,
+    pub artwork: Option<(&'a [u8], u32, u32)>,
+}
+
+pub fn set_now_playing_sink(sink: impl Fn(&NowPlaying) + 'static) {
+    NOW_SINK.with_borrow_mut(|s| *s = Some(Box::new(sink)));
+}
+
+pub(crate) fn now_playing(now: &NowPlaying) {
+    NOW_SINK.with_borrow(|s| {
+        if let Some(s) = s {
+            s(now);
+        }
+    });
+}
+
+pub fn media(code: i32) {
+    use livi_core_proto::message::MediaControl;
+    use livi_ui_model::media::Pressed;
+    let (which, control) = match code {
+        0 => (Pressed::Play, MediaControl::PlayPause),
+        1 => (Pressed::Play, MediaControl::Play),
+        2 => (Pressed::Play, MediaControl::Pause),
+        3 => (Pressed::Next, MediaControl::Next),
+        4 => (Pressed::Prev, MediaControl::Prev),
+        _ => return,
+    };
+    let Some(ui) = MAIN.with_borrow(|m| m.as_ref().and_then(Weak::upgrade)) else {
+        return;
+    };
+    CLIENT.with_borrow(|c| {
+        if let Some(c) = c {
+            media_ui::act(&ui, c, which, control);
+        }
+    });
+}
+
+fn own_panel(ui: &AppWindow) {
+    ui.set_keep_safe_area(false);
+    #[cfg(target_os = "ios")]
+    defer_system_gestures(ui);
+}
+
+// Slint's Skia renderer sends no rendering notifier on iOS, so the winit window is awaited instead.
+#[cfg(target_os = "ios")]
+fn defer_system_gestures(ui: &AppWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    use slint::winit_030::winit::platform::ios::{ScreenEdge, WindowExtIOS};
+    let weak = ui.as_weak();
+    let _ = slint::spawn_local(async move {
+        let Some(ui) = weak.upgrade() else { return };
+        let Ok(window) = ui.window().winit_window().await else {
+            eprintln!("[ui] no winit window to hide the home indicator in");
+            return;
+        };
+        window.set_prefers_home_indicator_hidden(true);
+        window.set_preferred_screen_edges_deferring_system_gestures(ScreenEdge::ALL);
     });
 }
 
@@ -454,10 +595,13 @@ pub fn run(
     fixture: Option<Value>,
     kiosk: impl Fn(bool) + 'static,
     pick: Option<Pick>,
+    full_panel: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     KIOSK.with_borrow_mut(|k| *k = Some(Box::new(kiosk)));
     PICK.with_borrow_mut(|p| *p = pick);
     let ui = AppWindow::new()?;
+    #[cfg(kms)]
+    fonts::stand_in_generics();
     slint::set_xdg_app_id(
         std::env::var("LIVI_OUTPUT_APP_ID").unwrap_or_else(|_| "dev.f-io.livi".into()),
     )?;
@@ -479,9 +623,13 @@ pub fn run(
     MAIN.with_borrow_mut(|m| *m = Some(weak.clone()));
     let lang = client.mirror().state.config.language.clone();
     settings_ui::wire(&ui, &client, &lang);
-    #[cfg(not(target_os = "android"))]
+    keyboard_ui::wire(&ui);
+    if full_panel {
+        own_panel(&ui);
+    }
+    #[cfg(winit)]
     keys_ui::wire(&ui, &client);
-    #[cfg(target_os = "android")]
+    #[cfg(not(winit))]
     touch_ui::wire(&ui, &client);
     video_ui::wire(&ui, &client);
     wire(&ui, &client);
@@ -517,28 +665,25 @@ pub fn run(
         }
     });
 
-    ui.window().set_rendering_notifier({
+    let notified = ui.window().set_rendering_notifier({
         let weak = weak.clone();
         move |state, _| {
-            let (slint::RenderingState::RenderingSetup, Some(ui)) = (state, weak.upgrade()) else {
-                return;
-            };
-            if !attach_video(ui.window(), "main") {
-                eprintln!("[ui] the window has no native handle for the video");
-            }
-            #[cfg(not(target_os = "android"))]
-            cursor_ui::start(&ui);
-            if BASE_SCALE.get().is_none() {
-                BASE_SCALE.set(Some(ui.window().scale_factor()));
-                let weak = weak.clone();
-                Timer::single_shot(Duration::ZERO, move || {
-                    if let Some(ui) = weak.upgrade() {
-                        apply_zoom(&ui);
-                    }
-                });
+            if let (slint::RenderingState::RenderingSetup, Some(ui)) = (state, weak.upgrade()) {
+                rendering_set_up(&ui);
             }
         }
-    })?;
+    });
+    // The software renderer has no notifier, its window is set up once the event loop runs.
+    if let Err(slint::SetRenderingNotifierError::Unsupported) = notified {
+        let weak = weak.clone();
+        Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = weak.upgrade() {
+                rendering_set_up(&ui);
+            }
+        });
+    } else {
+        notified?;
+    }
     if let Some((w, h)) = std::env::var("LIVI_UI_SIZE")
         .ok()
         .and_then(|s| {

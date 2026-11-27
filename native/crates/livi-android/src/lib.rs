@@ -13,7 +13,9 @@ mod logcat;
 mod media;
 mod planes;
 mod update;
+mod volume;
 
+use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -24,8 +26,8 @@ use jni::errors::LogErrorAndDefault;
 use jni::objects::{JClass, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint};
 use jni::{EnvUnowned, JValue, jni_sig, jni_str};
-use livi_core::{Exit, Helper, Installer, Instance, MediaHost, Paths, Resources};
-use livi_helper::embedded::{Embedded, Host};
+use livi_core::{Exit, Helper, Installer, Instance, OutputBackend, Paths, Resources};
+use livi_helper::in_process::{Host, InProcessHelper};
 use slint::android::AndroidApp;
 use slint::android::android_activity::WindowManagerFlags;
 
@@ -49,6 +51,16 @@ fn start(app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
     );
     let socket = CORE.get_or_init(|| core(&app)).clone()?;
     slint::android::init(app.clone())?;
+    livi_ui::set_media_sink(|playing| {
+        if let Err(e) = call(jni_str!("mediaState"), playing) {
+            eprintln!("[android] media state: {e}");
+        }
+    });
+    livi_ui::set_now_playing_sink(|now| {
+        if let Err(e) = now_playing(now) {
+            eprintln!("[android] now playing: {e}");
+        }
+    });
     livi_ui::run(
         || livi_core_client::wait_for_socket(&socket, CORE_START),
         None,
@@ -58,6 +70,7 @@ fn start(app: AndroidApp) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         Some(Box::new(pick)),
+        false,
     )?;
     if let Some(&restart) = CORE_EXIT.get() {
         call(jni_str!("exit"), restart)?;
@@ -72,10 +85,11 @@ fn core(app: &AndroidApp) -> Result<PathBuf, String> {
     let files = app.internal_data_path().ok_or("no app data dir")?;
     let paths = Paths::within(&files, files.join("run"));
     let socket = paths.socket();
+    livi_core::set_device_volume(volume::Volume);
     livi_aaudio::register().map_err(|e| format!("no AAudio elements: {e}"))?;
     livi_aaudio::set_lister(audio::lister());
     livi_video_player::set_views(planes::Planes);
-    livi_video_view::set_window(livi_host_proto::SCREENS[0], planes::STAGE);
+    livi_video_view::set_window(livi_output_proto::SCREENS[0], planes::STAGE);
     livi_video_view::serve(&paths.runtime.join("compositor.ctrl"))
         .map_err(|e| format!("no video control: {e}"))?;
     let host = Host {
@@ -85,22 +99,22 @@ fn core(app: &AndroidApp) -> Result<PathBuf, String> {
         tunnel: iap2_usbmux::Tunnel::new(Arc::new(tun)),
         phones: Arc::new(bluetooth::phones),
         hotspot: Arc::new(hotspot::open),
-        drop_phone: Arc::new(bluetooth::drop),
+        drop_phone: Arc::new(|mac| bluetooth::drop(mac).map_err(Into::into)),
         page_phone: Arc::new(bluetooth::page),
         bt_keys: files.join("bluetooth-keys"),
     };
     let res = Resources {
-        helper: Some(Helper::Embedded(Arc::new(move |start| {
-            Embedded::start(start, host.clone())
+        helper: Some(Helper::InProcess(Arc::new(move |start| {
+            InProcessHelper::start(start, host.clone())
                 .map(|helper| Box::new(helper) as Box<dyn Send>)
                 .map_err(|e| format!("no helper thread: {e}"))
         }))),
-        gst_host: Some(MediaHost::Embedded(Arc::new(media::InProcess))),
+        output: Some(OutputBackend::InProcess(Arc::new(media::InProcess))),
         installer: Some(Installer {
             downloads: files.join("update"),
             install: Arc::new(update::install),
         }),
-        ..Resources::embedded()
+        ..Resources::in_process()
     };
     let instance = Instance::claim(paths)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -134,6 +148,37 @@ fn call(method: &jni::strings::JNIStr, flag: bool) -> jni::errors::Result<()> {
     })
 }
 
+fn now_playing(now: &livi_ui::NowPlaying) -> jni::errors::Result<()> {
+    activity::with(|env, activity| {
+        let title = env.new_string(now.title)?;
+        let artist = env.new_string(now.artist)?;
+        let album = env.new_string(now.album)?;
+        let (art, width, height) = match now.artwork {
+            Some((pixels, w, h)) => (
+                JObject::from(env.byte_array_from_slice(pixels)?),
+                jint::try_from(w).unwrap_or(0),
+                jint::try_from(h).unwrap_or(0),
+            ),
+            None => (JObject::null(), 0, 0),
+        };
+        env.call_method(
+            activity,
+            jni_str!("nowPlaying"),
+            jni_sig!("(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J[BII)V"),
+            &[
+                JValue::Object(&title),
+                JValue::Object(&artist),
+                JValue::Object(&album),
+                JValue::Long(now.duration_ms as i64),
+                JValue::Object(&art),
+                JValue::Int(width),
+                JValue::Int(height),
+            ],
+        )
+        .map(drop)
+    })
+}
+
 fn pick() {
     let opened = activity::with(|env, activity| {
         env.call_method(activity, jni_str!("pick"), jni_sig!("()V"), &[])
@@ -144,7 +189,7 @@ fn pick() {
     }
 }
 
-fn tun(request: &TunRequest) -> Result<OwnedFd, String> {
+fn tun(request: &TunRequest) -> io::Result<OwnedFd> {
     let fd = activity::with(|env, activity| {
         let addresses = request
             .addresses
@@ -164,10 +209,11 @@ fn tun(request: &TunRequest) -> Result<OwnedFd, String> {
         )?
         .i()
     })
-    .map_err(|e| format!("VPN service: {e}"))?;
+    .map_err(|e| io::Error::other(format!("VPN service: {e}")))?;
     if fd < 0 {
-        return Err("the VPN service opened no interface".into());
+        return Err(io::Error::other("the VPN service opened no interface"));
     }
+    // SAFETY: Java detached the tun fd and hands its ownership over.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -232,15 +278,29 @@ extern "system" fn Java_dev_fio_livi_LiviActivity_surface<'caller>(
 extern "system" fn Java_dev_fio_livi_LiviActivity_key<'caller>(
     _env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
+    keycode: jint,
     scancode: jint,
+    typed: jint,
     down: jboolean,
     repeat: jboolean,
 ) {
-    let Some(code) = u16::try_from(scancode)
-        .ok()
-        .and_then(livi_ui_model::scancode::code)
-    else {
+    let Some(code) = livi_ui_model::keycode::name(keycode, scancode) else {
         return;
     };
-    let _ = slint::invoke_from_event_loop(move || livi_ui::key(code, down, repeat));
+    let typed = u32::try_from(typed)
+        .ok()
+        .filter(|c| *c != 0)
+        .and_then(char::from_u32)
+        .map(String::from);
+    let _ =
+        slint::invoke_from_event_loop(move || livi_ui::key(&code, typed.as_deref(), down, repeat));
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_fio_livi_LiviActivity_media<'caller>(
+    _env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    control: jint,
+) {
+    let _ = slint::invoke_from_event_loop(move || livi_ui::media(control));
 }

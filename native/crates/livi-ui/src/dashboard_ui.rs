@@ -5,8 +5,9 @@
 use std::rc::Rc;
 
 use livi_core_client::Client;
+use livi_core_proto::config::ClusterContent;
 use livi_core_proto::message::Action;
-use livi_core_proto::state::{Screen, State};
+use livi_core_proto::state::{Protocol, Screen, State};
 use livi_ui_model::dashboard::gauge::{self, Drawing, Scale, Spec, draw, groups, label_overflow};
 use livi_ui_model::dashboard::layout::{Center, pages, spec};
 use livi_ui_model::dashboard::nav::{Lane, Nav, nav};
@@ -49,7 +50,7 @@ pub struct GaugeView {
     groups: gauge::Groups,
     mirror: bool,
     redline_index: f64,
-    shadow: Pixels,
+    shadow: Option<Pixels>,
     shadow_half: f64,
 }
 
@@ -60,6 +61,8 @@ pub struct DashView {
     ring_shift: f64,
     gauges: bool,
     map: bool,
+    map_dark: bool,
+    phone_eta: bool,
     center: Center,
     strip: bool,
     page_count: usize,
@@ -75,14 +78,14 @@ pub struct DashView {
 
 #[derive(Default)]
 pub struct DashReader {
-    speed_key: Option<(Scale, f64)>,
-    rpm_key: Option<(Scale, f64)>,
+    speed_key: Option<(Scale, f64, bool)>,
+    rpm_key: Option<(Scale, f64, bool)>,
     image: Option<String>,
     lanes: Vec<Lane>,
     lamps: Vec<Lamp>,
 }
 
-fn gauge_view(scale: &Scale, mirror: bool, redline: f64) -> GaugeView {
+fn gauge_view(scale: &Scale, mirror: bool, redline: f64, shadowed: bool) -> GaugeView {
     let spec = Spec {
         mirror,
         ..Spec::default()
@@ -93,18 +96,21 @@ fn gauge_view(scale: &Scale, mirror: bool, redline: f64) -> GaugeView {
     } else {
         f64::MAX
     };
-    let s = gauge::shadow(&drawing, mirror);
-    let mut shadow = Pixels::new(s.size as u32, s.size as u32);
-    for (px, a) in shadow.make_mut_slice().iter_mut().zip(&s.alpha) {
-        *px = slint::Rgba8Pixel::new(255, 255, 255, *a);
-    }
+    let s = shadowed.then(|| gauge::shadow(&drawing, mirror));
+    let shadow = s.as_ref().map(|s| {
+        let mut px = Pixels::new(s.size as u32, s.size as u32);
+        for (px, a) in px.make_mut_slice().iter_mut().zip(&s.alpha) {
+            *px = slint::Rgba8Pixel::new(255, 255, 255, *a);
+        }
+        px
+    });
     GaugeView {
         groups: groups(&drawing, (redline > 0.0).then_some(redline_index)),
         drawing,
         mirror,
         redline_index,
         shadow,
-        shadow_half: s.half,
+        shadow_half: s.map_or(0.0, |s| s.half),
     }
 }
 
@@ -116,15 +122,18 @@ impl DashReader {
             self.lamps = lit.clone();
             lit
         });
-        let speed_key = (r.speed_scale.clone(), 0.0);
+        let p = pages(state, dark);
+        let layout = spec(p.active.as_deref().unwrap_or(""));
+        let shadowed = r.enabled && layout.map;
+        let speed_key = (r.speed_scale.clone(), 0.0, shadowed);
         let speed_gauge = (self.speed_key.as_ref() != Some(&speed_key)).then(|| {
             self.speed_key = Some(speed_key);
-            gauge_view(&r.speed_scale, false, 0.0)
+            gauge_view(&r.speed_scale, false, 0.0, shadowed)
         });
-        let rpm_key = (r.rpm_scale.clone(), r.redline);
+        let rpm_key = (r.rpm_scale.clone(), r.redline, shadowed);
         let rpm_gauge = (self.rpm_key.as_ref() != Some(&rpm_key)).then(|| {
             self.rpm_key = Some(rpm_key);
-            gauge_view(&r.rpm_scale, true, r.redline)
+            gauge_view(&r.rpm_scale, true, r.redline, shadowed)
         });
         let base = Spec::default();
         let ring_shift = label_overflow(&base, &r.speed_scale, RING_W, RING_H, -LEFT_RING_LEFT)
@@ -135,8 +144,6 @@ impl DashReader {
                 RING_H,
                 RIGHT_RING_LEFT + RING_W - BASE_W,
             ));
-        let p = pages(state, dark);
-        let layout = spec(p.active.as_deref().unwrap_or(""));
         let n = nav(state);
         let nav_image_raw = (n.image != self.image).then(|| {
             self.image = n.image.clone();
@@ -153,6 +160,11 @@ impl DashReader {
             ring_shift,
             gauges: layout.gauges,
             map: layout.map,
+            map_dark: state.config.cluster_map_night_mode,
+            phone_eta: layout.map
+                && state.sessions.active == Some(Protocol::Carplay)
+                && state.config.car_play_cluster_eta
+                && state.config.car_play_cluster_content != ClusterContent::Maneuver,
             center: layout.center,
             strip: layout.strip,
             page_count: p.count,
@@ -222,7 +234,7 @@ fn gauge_data(v: &GaugeView) -> GaugeData {
         major_h: (Spec::default().major_h * d.fit) as f32,
         ticks: d.arc_ticks as i32,
         redline_index: v.redline_index.min(1e6) as f32,
-        shadow: Image::from_rgba8(v.shadow.clone()),
+        shadow: v.shadow.clone().map(Image::from_rgba8).unwrap_or_default(),
         shadow_half: v.shadow_half as f32,
     }
 }
@@ -261,12 +273,13 @@ pub fn fill(d: &DashState<'_>, mut v: DashView) {
     d.set_enabled(r.enabled);
     d.set_gauges(v.gauges);
     d.set_map(v.map);
+    d.set_map_dark(v.map_dark);
+    d.set_phone_eta(v.phone_eta);
     d.set_strip(v.strip);
     d.set_mask(mask_data(v.mask));
     d.set_center(match v.center {
         Center::None => 0,
         Center::NavMini => 1,
-        Center::NavFull => 2,
     });
     if let Some(g) = &v.speed_gauge {
         d.set_speed_gauge(gauge_data(g));
@@ -338,8 +351,6 @@ pub fn fill(d: &DashState<'_>, mut v: DashView) {
     d.set_nav_after_road(s(&n.after_road));
     d.set_nav_time_left(s(&n.time_left));
     d.set_nav_destination_distance(s(&n.destination_distance));
-    d.set_nav_destination(s(&n.destination));
-    d.set_nav_app(s(&n.app));
     d.set_nav_eta(s(&n.eta));
     if let Some(lanes) = v.lanes.take() {
         d.set_nav_lanes(model(

@@ -5,8 +5,8 @@
 pub mod calibration;
 pub mod color;
 pub mod custom;
+pub mod mask;
 pub mod node;
-pub mod restart;
 pub mod schemas;
 pub mod sources;
 pub mod value;
@@ -14,8 +14,9 @@ pub mod view;
 
 use node::{Label, Node};
 
-pub const STATE_READ: [&str; 11] = [
+pub const STATE_READ: [&str; 12] = [
     "config",
+    "audio",
     "system",
     "telemetry",
     "mfi",
@@ -132,11 +133,15 @@ mod tests {
         let mut all = Vec::new();
         walk(&root, &mut all);
         assert!(all.len() > 200);
-        assert!(
-            all.iter()
-                .filter(|n| matches!(n.kind, Kind::Custom(_)))
-                .count()
-                == 21
-        );
+        let custom_pages: Vec<_> = all
+            .iter()
+            .filter_map(|n| match &n.kind {
+                Kind::Custom(page) => Some(page),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(custom_pages.len(), 22);
+        assert!(custom_pages.contains(&&super::node::CustomPage::AudioInfo));
+        assert!(custom_pages.contains(&&super::node::CustomPage::SystemStatistics));
     }
 }

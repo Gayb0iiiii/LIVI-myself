@@ -66,6 +66,8 @@ export global DashState {
     in property <bool> enabled;
     in property <bool> gauges: true;
     in property <bool> map;
+    in property <bool> map-dark: true;
+    in property <bool> phone-eta;
     in property <bool> strip;
     in property <MaskData> mask;
     in property <int> center;
@@ -113,8 +115,6 @@ export global DashState {
     in property <string> nav-after-road;
     in property <string> nav-time-left;
     in property <string> nav-destination-distance;
-    in property <string> nav-destination;
-    in property <string> nav-app;
     in property <string> nav-eta;
     in property <[LaneData]> nav-lanes;
     in property <string> placeholder: "No dashboard on this screen";

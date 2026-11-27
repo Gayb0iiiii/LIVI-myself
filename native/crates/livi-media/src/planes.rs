@@ -5,14 +5,14 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use livi_host_proto::{
+use livi_output_proto::{
     AIRPLAY_TAG, CAMERA_TAG, CLUSTER_PLANE_MIN, CameraOrder, MAIN_TAG, PLANE_AIRPLAY, PLANE_CAMERA,
     PLANE_MAIN, PLANE_VIDEO, SCREENS, VIDEO_TAG,
 };
 use tokio::sync::broadcast;
 
 use crate::compositor::CompositorControl;
-use crate::gst_host::{GstHost, HostEvent, VideoCodec};
+use crate::output::{Output, OutputEvent, VideoCodec};
 
 const SCREEN: &str = SCREENS[0];
 
@@ -57,9 +57,15 @@ fn same_stream(codec: Option<VideoCodec>, data: &[u8], next: VideoCodec, atom: &
     codec == Some(next) && data == atom
 }
 
+fn single_decoder() -> bool {
+    livi_output_proto::video_decoders() == 1
+}
+
 #[derive(Default)]
 struct State {
     started: bool,
+    give_way: bool,
+    gave_way: bool,
     claiming: bool,
     codec: Option<VideoCodec>,
     codec_data: Vec<u8>,
@@ -69,22 +75,22 @@ struct State {
 pub struct MainPlane {
     id: u32,
     tag: &'static str,
-    gst: GstHost,
+    gst: Output,
     comp: CompositorControl,
     state: Mutex<State>,
     created: broadcast::Sender<()>,
 }
 
 impl MainPlane {
-    pub fn new(gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    pub fn new(gst: Output, comp: CompositorControl) -> Arc<Self> {
         Self::on(PLANE_MAIN, MAIN_TAG, gst, comp)
     }
 
-    pub fn airplay(gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    pub fn airplay(gst: Output, comp: CompositorControl) -> Arc<Self> {
         Self::on(PLANE_AIRPLAY, AIRPLAY_TAG, gst, comp)
     }
 
-    fn on(id: u32, tag: &'static str, gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    fn on(id: u32, tag: &'static str, gst: Output, comp: CompositorControl) -> Arc<Self> {
         let (created, _) = broadcast::channel(8);
         Arc::new(Self {
             id,
@@ -104,7 +110,7 @@ impl MainPlane {
         self.created.subscribe()
     }
 
-    pub fn host_events(&self) -> broadcast::Receiver<HostEvent> {
+    pub fn host_events(&self) -> broadcast::Receiver<OutputEvent> {
         self.gst.subscribe()
     }
 
@@ -133,6 +139,10 @@ impl MainPlane {
                 st.claiming = false;
                 st.started = true;
                 st.codec = Some(codec);
+                if single_decoder() && st.give_way {
+                    st.gave_way = true;
+                    return;
+                }
                 st.codec_data.clone()
             };
             plane.gst.create_player(plane.id, codec, &data);
@@ -158,12 +168,36 @@ impl MainPlane {
         self.comp.videoshow(self.tag, visible);
     }
 
+    pub fn give_way(&self, give: bool) {
+        if !single_decoder() {
+            return;
+        }
+        let create = {
+            let mut st = self.state();
+            st.give_way = give;
+            if !st.started || st.gave_way == give {
+                return;
+            }
+            st.gave_way = give;
+            (!give).then(|| (st.codec, st.codec_data.clone()))
+        };
+        match create {
+            Some((Some(codec), data)) => {
+                self.gst.create_player(self.id, codec, &data);
+                let _ = self.created.send(());
+            }
+            Some((None, _)) => {}
+            None => self.gst.stop(self.id),
+        }
+    }
+
     pub fn dispose(&self) {
         let started = {
             let mut st = self.state();
             st.claiming = false;
             st.generation += 1;
             st.codec = None;
+            st.gave_way = false;
             std::mem::take(&mut st.started)
         };
         self.comp.release(self.tag);
@@ -171,17 +205,28 @@ impl MainPlane {
             self.gst.stop(self.id);
         }
     }
+
+    pub fn refresh(&self) {
+        let create = {
+            let st = self.state();
+            (st.started && !st.gave_way).then(|| (st.codec, st.codec_data.clone()))
+        };
+        if let Some((Some(codec), data)) = create {
+            self.gst.create_player(self.id, codec, &data);
+            let _ = self.created.send(());
+        }
+    }
 }
 
 pub struct VideoPlane {
-    gst: GstHost,
+    gst: Output,
     comp: CompositorControl,
     stops: AtomicU64,
     shown: AtomicBool,
 }
 
 impl VideoPlane {
-    pub fn new(gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    pub fn new(gst: Output, comp: CompositorControl) -> Arc<Self> {
         Arc::new(Self {
             gst,
             comp,
@@ -236,13 +281,13 @@ impl VideoPlane {
 }
 
 pub struct CameraPlane {
-    gst: GstHost,
+    gst: Output,
     comp: CompositorControl,
     stops: AtomicU64,
 }
 
 impl CameraPlane {
-    pub fn new(gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    pub fn new(gst: Output, comp: CompositorControl) -> Arc<Self> {
         Arc::new(Self {
             gst,
             comp,
@@ -280,7 +325,7 @@ impl CameraPlane {
 const CLUSTER_SCREENS: [&str; 3] = SCREENS;
 
 fn cluster_tag(i: usize) -> String {
-    livi_host_proto::cluster_tag(CLUSTER_SCREENS[i])
+    livi_output_proto::cluster_tag(CLUSTER_SCREENS[i])
 }
 
 fn cluster_plane(i: usize) -> u32 {
@@ -304,14 +349,14 @@ struct ClusterState {
 }
 
 pub struct ClusterPlanes {
-    gst: GstHost,
+    gst: Output,
     comp: CompositorControl,
     state: Mutex<ClusterState>,
     created: broadcast::Sender<()>,
 }
 
 impl ClusterPlanes {
-    pub fn new(gst: GstHost, comp: CompositorControl) -> Arc<Self> {
+    pub fn new(gst: Output, comp: CompositorControl) -> Arc<Self> {
         let (created, _) = broadcast::channel(8);
         Arc::new(Self {
             gst,
@@ -374,6 +419,26 @@ impl ClusterPlanes {
         for i in 0..CLUSTER_SCREENS.len() {
             self.stop(i);
         }
+    }
+
+    pub fn refresh(&self) {
+        let jobs: Vec<(usize, VideoCodec, Vec<u8>)> = {
+            let st = self.state();
+            match st.codec {
+                Some(codec) => (0..CLUSTER_SCREENS.len())
+                    .filter(|&i| st.slots[i].started)
+                    .map(|i| (i, codec, st.codec_data.clone()))
+                    .collect(),
+                None => return,
+            }
+        };
+        if jobs.is_empty() {
+            return;
+        }
+        for (i, codec, data) in jobs {
+            self.gst.create_player(cluster_plane(i), codec, &data);
+        }
+        let _ = self.created.send(());
     }
 
     fn start(self: &Arc<Self>, i: usize) {
@@ -509,7 +574,7 @@ mod tests {
     async fn the_player_is_created_after_the_claim_and_only_once() {
         let dir = TempDir::new();
         let comp_listener = UnixListener::bind(dir.0.join("ctrl")).unwrap();
-        let gst = GstHost::new(dir.0.join("gst.sock"));
+        let gst = Output::new(dir.0.join("gst.sock"));
         let plane = MainPlane::new(gst.clone(), CompositorControl::connect(dir.0.join("ctrl")));
         let mut created = plane.player_created();
 
@@ -545,9 +610,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut framer = livi_host_proto::Framer::new();
+        let mut framer = livi_output_proto::Framer::new();
         framer.push(&buf[..n]);
-        let msg = framer.next_message().unwrap();
+        let msg = framer.next_message().unwrap().unwrap();
         assert_eq!((msg.op, msg.id), (1, PLANE_MAIN));
         assert_eq!(msg.rest, [&[4u8][..], b"h264", &[1, 2]].concat());
         assert!(created.try_recv().is_err());
@@ -563,11 +628,11 @@ mod tests {
 
     async fn next_msg(
         host: &mut UnixStream,
-        framer: &mut livi_host_proto::Framer,
-    ) -> livi_host_proto::Message {
+        framer: &mut livi_output_proto::Framer,
+    ) -> livi_output_proto::Message {
         loop {
             if let Some(msg) = framer.next_message() {
-                return msg;
+                return msg.unwrap();
             }
             let mut buf = vec![0u8; 64];
             let n = tokio::time::timeout(Duration::from_secs(5), host.read(&mut buf))
@@ -582,7 +647,7 @@ mod tests {
     async fn a_cluster_player_runs_on_each_screen_that_shows_it() {
         let dir = TempDir::new();
         let comp_listener = UnixListener::bind(dir.0.join("ctrl")).unwrap();
-        let gst = GstHost::new(dir.0.join("gst.sock"));
+        let gst = Output::new(dir.0.join("gst.sock"));
         let planes =
             ClusterPlanes::new(gst.clone(), CompositorControl::connect(dir.0.join("ctrl")));
         let mut created = planes.player_created();
@@ -609,7 +674,7 @@ mod tests {
         assert!(seen.contains(&"videoshow cluster-cluster 1".to_string()));
 
         let mut host = UnixStream::connect(dir.0.join("gst.sock")).await.unwrap();
-        let mut framer = livi_host_proto::Framer::new();
+        let mut framer = livi_output_proto::Framer::new();
         let msg = next_msg(&mut host, &mut framer).await;
         assert_eq!((msg.op, msg.id), (1, CLUSTER_PLANE_MIN + 1));
 
@@ -629,7 +694,7 @@ mod tests {
     async fn the_video_plane_lies_over_the_main_screen_until_it_stops() {
         let dir = TempDir::new();
         let comp_listener = UnixListener::bind(dir.0.join("ctrl")).unwrap();
-        let gst = GstHost::new(dir.0.join("gst.sock"));
+        let gst = Output::new(dir.0.join("gst.sock"));
         let plane = VideoPlane::new(gst.clone(), CompositorControl::connect(dir.0.join("ctrl")));
 
         assert!(
@@ -651,11 +716,11 @@ mod tests {
         assert!(seen.contains(&"claim video".to_string()));
 
         let mut host = UnixStream::connect(dir.0.join("gst.sock")).await.unwrap();
-        let mut framer = livi_host_proto::Framer::new();
+        let mut framer = livi_output_proto::Framer::new();
         let msg = next_msg(&mut host, &mut framer).await;
         assert_eq!((msg.op, msg.id), (22, PLANE_VIDEO));
         assert_eq!(
-            livi_host_proto::parse_url_body(&msg.rest),
+            livi_output_proto::parse_url_body(&msg.rest),
             Some(("http://127.0.0.1:9/i.m3u8".into(), "car".into()))
         );
 
@@ -695,7 +760,7 @@ mod tests {
     async fn a_hidden_video_plane_stays_hidden_for_the_next_play() {
         let dir = TempDir::new();
         let comp_listener = UnixListener::bind(dir.0.join("ctrl")).unwrap();
-        let gst = GstHost::new(dir.0.join("gst.sock"));
+        let gst = Output::new(dir.0.join("gst.sock"));
         let plane = VideoPlane::new(gst.clone(), CompositorControl::connect(dir.0.join("ctrl")));
 
         let (ctrl, _) = tokio::time::timeout(Duration::from_secs(5), comp_listener.accept())

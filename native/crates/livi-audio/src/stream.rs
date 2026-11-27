@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Additional terms: see NOTICE
 
-use livi_crypto::open;
+use livi_crypto::{ChaCha, nonce64};
+pub use livi_output_proto::audio::AudioCodec as Codec;
 
 pub const RTP_HEADER_LEN: usize = 12;
 pub const TAIL_LEN: usize = 24;
-const TAG_LEN: usize = 16;
 const NONCE_LEN: usize = 8;
 
 pub trait AudioSink {
@@ -15,22 +15,25 @@ pub trait AudioSink {
 }
 
 pub struct AudioStream {
-    key: [u8; 32],
+    key: ChaCha,
     started: bool,
+    next_seq: Option<u16>,
     sink: Box<dyn AudioSink + Send>,
 }
 
 impl AudioStream {
     pub fn new(key: [u8; 32], sink: Box<dyn AudioSink + Send>) -> Self {
         Self {
-            key,
+            key: ChaCha::new(&key),
             started: false,
+            next_seq: None,
             sink,
         }
     }
 
     pub fn reset(&mut self) {
         self.started = false;
+        self.next_seq = None;
     }
 
     pub fn push(&mut self, packet: &[u8]) {
@@ -41,21 +44,18 @@ impl AudioStream {
         let aad = &packet[4..RTP_HEADER_LEN];
         let body = &packet[RTP_HEADER_LEN..end - TAIL_LEN];
         let tag = &packet[end - TAIL_LEN..end - NONCE_LEN];
-        let short_nonce = &packet[end - NONCE_LEN..];
+        let counter = packet[end - NONCE_LEN..].try_into().map(u64::from_le_bytes);
+        let Ok(counter) = counter else {
+            return;
+        };
 
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(short_nonce);
-
-        let mut sealed = Vec::with_capacity(body.len() + TAG_LEN);
-        sealed.extend_from_slice(body);
-        sealed.extend_from_slice(tag);
-
-        let Some(payload) = open(&self.key, &nonce, &sealed, aad) else {
+        let Some(payload) = self.key.open_detached(&nonce64(counter), body, tag, aad) else {
             eprintln!("[cp_audio] packet failed authentication");
             return;
         };
 
         let sample = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        self.check_seq(u16::from_be_bytes([packet[2], packet[3]]));
         if !self.started {
             self.started = true;
             self.sink.on_started(sample);
@@ -66,18 +66,19 @@ impl AudioStream {
         rtp.extend_from_slice(&payload);
         self.sink.on_rtp(&rtp, sample);
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Codec {
-    AacLc,
-    Opus,
-    Lpcm,
-    PcmLe,
-    AacRaw,
-    AacEld,
-    Alac,
-    Alac24,
+    fn check_seq(&mut self, seq: u16) {
+        let gap = self
+            .next_seq
+            .map_or(0, |next| seq.wrapping_sub(next) as i16);
+        if gap > 0 {
+            eprintln!("[cp_audio] {gap} packets lost before {seq}");
+        } else if gap < 0 {
+            eprintln!("[cp_audio] packet {seq} late by {}", -gap);
+            return;
+        }
+        self.next_seq = Some(seq.wrapping_add(1));
+    }
 }
 
 fn aac_freq_index(clock_rate: u32) -> u16 {
@@ -96,10 +97,10 @@ fn aac_freq_index(clock_rate: u32) -> u16 {
 }
 
 pub fn lpcm_caps(codec: Codec, clock_rate: u32, channels: u8) -> String {
-    let format = if codec == Codec::PcmLe {
-        "S16LE"
-    } else {
-        "S16BE"
+    let format = match codec {
+        Codec::PcmLe => "S16LE",
+        Codec::Pcm24 => "S24BE",
+        _ => "S16BE",
     };
     format!("audio/x-raw,format={format},layout=interleaved,rate={clock_rate},channels={channels}")
 }
@@ -133,7 +134,7 @@ pub fn alac_caps(clock_rate: u32, channels: u8, bits: u8) -> String {
 }
 
 pub fn aac_raw_caps(asc: &[u8], clock_rate: u32, channels: u8) -> String {
-    let hex: String = asc.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = livi_base::hex::encode(asc);
     format!(
         "audio/mpeg,mpegversion=(int)4,stream-format=(string)raw,framed=(boolean)true,\
          rate=(int){clock_rate},channels=(int){channels},codec_data=(buffer){hex}"
@@ -141,7 +142,7 @@ pub fn aac_raw_caps(asc: &[u8], clock_rate: u32, channels: u8) -> String {
 }
 
 pub fn rtp_caps(codec: Codec, payload_type: u8, clock_rate: u32, channels: u8) -> String {
-    if codec == Codec::Lpcm || codec == Codec::PcmLe {
+    if matches!(codec, Codec::Pcm | Codec::PcmLe | Codec::Pcm24) {
         return lpcm_caps(codec, clock_rate, channels);
     }
     if codec == Codec::Opus {
@@ -197,7 +198,7 @@ mod tests {
     }
 
     use super::*;
-    use livi_crypto::seal;
+    use livi_crypto::chacha_seal;
     use std::sync::{Arc, Mutex};
 
     const KEY: [u8; 32] = [9u8; 32];
@@ -246,9 +247,7 @@ mod tests {
         header.extend_from_slice(&sample.to_be_bytes());
         header.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
 
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&nonce_counter.to_le_bytes());
-        let sealed = seal(&KEY, &nonce, plain, &header[4..]).unwrap();
+        let sealed = chacha_seal(&KEY, &nonce64(nonce_counter), plain, &header[4..]);
 
         let mut pkt = header;
         pkt.extend_from_slice(&sealed);
@@ -363,8 +362,9 @@ mod wire {
 
     #[test]
     fn carplay_samples_are_big_endian_and_handed_over_ones_are_not() {
-        assert!(rtp_caps(Codec::Lpcm, 0, 44100, 2).contains("format=S16BE"));
+        assert!(rtp_caps(Codec::Pcm, 0, 44100, 2).contains("format=S16BE"));
         assert!(rtp_caps(Codec::PcmLe, 0, 44100, 2).contains("format=S16LE"));
+        assert!(rtp_caps(Codec::Pcm24, 0, 48000, 2).contains("format=S24BE"));
     }
 
     #[test]
@@ -427,7 +427,7 @@ pub mod receiver {
                 std::thread::Builder::new()
                     .name("cp-audio-rx".into())
                     .spawn(move || {
-                        set_realtime();
+                        crate::realtime::promote("cp-audio-rx");
                         let mut stream = stream;
                         let mut buf = [0u8; DATAGRAM];
                         while !data_stop.load(Ordering::Relaxed) {
@@ -460,16 +460,6 @@ pub mod receiver {
             for t in self.threads.drain(..) {
                 let _ = t.join();
             }
-        }
-    }
-
-    fn set_realtime() {
-        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
-        param.sched_priority = 10;
-        let rc =
-            unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
-        if rc != 0 {
-            eprintln!("[cp_audio_rx] real-time priority denied (rc={rc}); normal priority");
         }
     }
 }

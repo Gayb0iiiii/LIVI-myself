@@ -46,6 +46,7 @@ pub struct Context {
     pub settings_depth: usize,
     pub first: bool,
     pub repeat: bool,
+    pub keyboard: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +66,8 @@ pub enum Outcome {
     Adjust(i32),
     SettingsBack,
     Pager(i32),
+    KeyStep(i32, i32),
+    KeyPress,
 }
 
 pub fn binding<'a>(config: &'a Value, name: &str) -> &'a str {
@@ -77,6 +80,50 @@ pub fn bound_to(config: &Value, code: &str) -> Option<String> {
         .iter()
         .find(|(_, v)| v.as_str() == Some(code))
         .map(|(k, _)| k.clone())
+}
+
+pub fn typed_name(typed: &str) -> Option<String> {
+    let mut chars = typed.chars();
+    let c = chars.next()?;
+    if chars.next().is_none() {
+        return (!c.is_control() && !c.is_whitespace()).then(|| c.to_lowercase().collect());
+    }
+    (typed != "Unidentified" && typed.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then(|| typed.to_string())
+}
+
+pub fn always_back(code: &str) -> bool {
+    matches!(code, "Escape" | "BrowserBack")
+}
+
+pub fn resolve(code: &str, typed: Option<&str>, config: &Value) -> String {
+    typed
+        .and_then(typed_name)
+        .filter(|name| bound_to(config, name).is_some())
+        .unwrap_or_else(|| code.to_string())
+}
+
+/// The code a named binding presses, for a key that arrives by name from core.
+pub fn code_for(name: &str, config: &Value) -> Option<String> {
+    let fallback = match name {
+        "left" | "knobLeft" => "ArrowLeft",
+        "right" | "knobRight" => "ArrowRight",
+        "up" | "knobUp" => "ArrowUp",
+        "down" | "knobDown" => "ArrowDown",
+        "selectDown" => "Enter",
+        "back" => "Escape",
+        "cycleSession" => "KeyS",
+        _ => "",
+    };
+    Some(or(binding(config, name), fallback))
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+}
+
+pub fn binding_value(code: &str, typed: Option<&str>) -> String {
+    typed
+        .and_then(typed_name)
+        .unwrap_or_else(|| code.to_string())
 }
 
 fn or<'a>(v: &'a str, fallback: &'a str) -> &'a str {
@@ -95,7 +142,7 @@ pub fn decide(code: &str, ctx: Context, config: &Value) -> Outcome {
     let right = is("right", "ArrowRight") || knob("knobRight");
     let up = is("up", "ArrowUp") || knob("knobUp");
     let down = is("down", "ArrowDown") || knob("knobDown");
-    let back = (!b("back").is_empty() && code == b("back")) || code == "Escape";
+    let back = (!b("back").is_empty() && code == b("back")) || always_back(code);
     let enter = code == "Enter" || code == "NumpadEnter";
     let select_down = !b("selectDown").is_empty() && code == b("selectDown");
     let text_entry = ctx.focused == Focused::Text && ctx.editing;
@@ -144,15 +191,29 @@ pub fn decide(code: &str, ctx: Context, config: &Value) -> Outcome {
         }
     }
 
+    if ctx.keyboard && (text_entry || number_entry) {
+        return if always_back(code) || (back && code != "Backspace") {
+            Outcome::StopEditing
+        } else if enter || select_down {
+            Outcome::KeyPress
+        } else if left || right {
+            Outcome::KeyStep(if left { -1 } else { 1 }, 0)
+        } else if up || down {
+            Outcome::KeyStep(0, if up { -1 } else { 1 })
+        } else {
+            Outcome::Pass
+        };
+    }
+
     if text_entry {
-        if code == "Escape" || enter {
+        if always_back(code) || enter {
             return Outcome::StopEditing;
         }
         return Outcome::Pass;
     }
 
     if number_entry {
-        if code == "Escape" || enter {
+        if always_back(code) || enter {
             return Outcome::StopEditing;
         }
         if up || right {
@@ -257,7 +318,7 @@ pub fn mirror_key(code: &str, config: &Value, shown: bool) -> MirrorKey {
         return MirrorKey::Pass;
     }
     let bound = |name: &str| !b(name).is_empty() && code == b(name);
-    let leave = code == "Escape"
+    let leave = always_back(code)
         || code == "Enter"
         || code == "NumpadEnter"
         || bound("back")
@@ -306,6 +367,7 @@ mod tests {
             settings_depth: 0,
             first: false,
             repeat: false,
+            keyboard: false,
         }
     }
 
@@ -382,6 +444,15 @@ mod tests {
         c.projection = true;
         c.streaming = true;
         assert_eq!(decide("KeyE", c, &config), Outcome::ToCore("KeyE".into()));
+    }
+
+    #[test]
+    fn the_back_key_always_goes_back() {
+        let mut c = ctx(Zone::Main);
+        c.settings_depth = 2;
+        assert_eq!(decide("BrowserBack", c, &config()), Outcome::SettingsBack);
+        c.settings_depth = 0;
+        assert_eq!(decide("BrowserBack", c, &config()), Outcome::ToNav);
     }
 
     #[test]
@@ -470,6 +541,22 @@ mod tests {
     }
 
     #[test]
+    fn the_on_screen_keyboard_takes_the_arrows_and_enter() {
+        for focused in [Focused::Text, Focused::Number] {
+            let mut c = ctx(Zone::Main);
+            c.focused = focused;
+            c.editing = true;
+            c.keyboard = true;
+            assert_eq!(decide("ArrowUp", c, &config()), Outcome::KeyStep(0, -1));
+            assert_eq!(decide("ArrowRight", c, &config()), Outcome::KeyStep(1, 0));
+            assert_eq!(decide("Enter", c, &config()), Outcome::KeyPress);
+            assert_eq!(decide("Backspace", c, &config()), Outcome::Pass);
+            assert_eq!(decide("KeyA", c, &config()), Outcome::Pass);
+            assert_eq!(decide("Escape", c, &config()), Outcome::StopEditing);
+        }
+    }
+
+    #[test]
     fn nothing_focused_enters_the_page() {
         assert_eq!(
             decide("ArrowDown", ctx(Zone::None), &config()),
@@ -485,5 +572,31 @@ mod tests {
     fn push_to_talk_releases() {
         assert_eq!(released("KeyV", &config()), Some("KeyV".into()));
         assert_eq!(released("KeyP", &config()), None);
+    }
+
+    #[test]
+    fn a_key_goes_by_what_it_types_when_a_binding_names_that() {
+        let config = json!({ "bindings": { "zoomIn": "+", "home": "h", "back": "KeyB" } });
+        assert_eq!(resolve("BracketRight", Some("+"), &config), "+");
+        assert_eq!(resolve("Equal", Some("+"), &config), "+");
+        assert_eq!(resolve("KeyH", Some("H"), &config), "h");
+        assert_eq!(resolve("KeyB", Some("b"), &config), "KeyB");
+        assert_eq!(resolve("Space", Some(" "), &config), "Space");
+        assert_eq!(resolve("ArrowUp", Some("ArrowUp"), &config), "ArrowUp");
+        assert_eq!(binding_value("BracketRight", Some("+")), "+");
+        assert_eq!(binding_value("KeyZ", Some("Y")), "y");
+        assert_eq!(binding_value("F5", Some("F5")), "F5");
+        assert_eq!(binding_value("Space", Some(" ")), "Space");
+        assert_eq!(binding_value("Fn", None), "Fn");
+    }
+
+    #[test]
+    fn a_named_key_presses_its_binding_or_the_usual_key() {
+        assert_eq!(code_for("back", &config()).as_deref(), Some("Backspace"));
+        assert_eq!(
+            code_for("knobDown", &config()).as_deref(),
+            Some("ArrowDown")
+        );
+        assert_eq!(code_for("zoomIn", &config()), None);
     }
 }

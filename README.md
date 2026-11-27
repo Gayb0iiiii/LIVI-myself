@@ -6,7 +6,7 @@
 
 LIVI is an open-source Apple CarPlay and Android Auto head unit built in Rust with a Slint UI.
 
-It runs on Linux desktops and embedded boards as well as on macOS and Android (experimental). A native zero-copy GStreamer pipeline handles hardware-decoded video and low-latency audio. Multitouch and D-Pad navigation are built in, and it works even on very small embedded and OEM displays.
+It runs on Linux desktops and embedded boards as well as on macOS and Android. A native zero-copy GStreamer pipeline handles hardware-decoded video and low-latency audio. Multitouch and D-Pad navigation are built in, and it works even on very small embedded and OEM displays.
 
 ## Project Status
 
@@ -58,12 +58,11 @@ Both routes work on Linux. A Mac has no I²C bus to put a coprocessor on, so the
 
 LIVI does not support Apple's Basic Accessory Authentication on MacOS, but may in the future.
 
-For a chip on the board, configuration (`config.json`):
+For a chip on the board, LIVI looks on every I²C bus. Configuration (`config.json`):
 
-| Key                   | Default | Description                          |
-| --------------------- | ------- | ------------------------------------ |
-| `carPlayMfiI2cBus`    | `2`     | I²C bus number the coprocessor is on |
-| `carPlayMfiPowerGpio` | `21`    | GPIO that powers the coprocessor     |
+| Key                   | Default | Description                      |
+| --------------------- | ------- | -------------------------------- |
+| `carPlayMfiPowerGpio` | `21`    | GPIO that powers the coprocessor |
 
 Without one of these, native CarPlay is unavailable. All Android Auto paths work regardless.
 
@@ -299,10 +298,10 @@ In that case:
 
 After this, the app will launch normally and future updates will work without additional steps.
 
-## Android (arm64) – Experimental
+## Android (arm64)
 
-> [!WARNING]
-> The Android port is experimental. It is tested on AOSP Android 17 and on a Pixel 8 with latest GrapheneOS.
+> [!NOTE]
+> Tested on AOSP Android 17 and on a Pixel 8 with latest GrapheneOS. If LIVI does not run on your device, please open an issue.
 
 Install `LIVI-*-android-arm64.apk` on Android 10 or newer.
 
@@ -320,9 +319,9 @@ Install `LIVI-*-android-arm64.apk` on Android 10 or newer.
 
 Make sure the following packages and tools are installed on your system before building. The lists below cover both building and running, including everything native CarPlay needs:
 
-- **Rust** (via [rustup](https://rustup.rs), which installs the version pinned in `rust-toolchain.toml`): builds everything, the UI included.
+- **Rust** (via [rustup](https://rustup.rs), the latest stable release, `rustup update stable` keeps it current): builds everything, the UI included.
 - **build-essential** (Linux: includes `gcc`, `g++`, `make`, etc.)
-- **libgstreamer1.0-dev** + **libgstreamer-plugins-base1.0-dev** (required to build the `livi-gst-host` binary)
+- **libgstreamer1.0-dev** + **libgstreamer-plugins-base1.0-dev** (required to build the `livi-output` binary)
 - **libssl-dev** (Linux only: native CarPlay links OpenSSL)
 - **pkg-config**, **cmake** (AWS-LC build), **libwayland-dev** + **libxkbcommon-dev** (Linux only: the embedded Wayland compositor links both)
 - **libfontconfig1-dev** (Linux only: the UI looks up fonts through fontconfig)

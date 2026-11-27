@@ -127,6 +127,7 @@ fn release(feed: &Value) -> Release {
     }
 }
 
+#[cfg(feature = "net")]
 async fn check(client: &reqwest::Client, nightly: bool) -> Result<Release, String> {
     let feed = feed_url(nightly);
     let res = client.get(&feed).send().await.map_err(|e| e.to_string())?;
@@ -251,6 +252,7 @@ struct Download {
     stop: Option<oneshot::Sender<()>>,
 }
 
+#[cfg(feature = "net")]
 async fn download(
     client: reqwest::Client,
     url: String,
@@ -304,6 +306,7 @@ async fn download(
     Ok(())
 }
 
+#[cfg(feature = "net")]
 pub async fn run(
     core: Arc<Core>,
     mut asks: mpsc::UnboundedReceiver<UpdateAsk>,
@@ -461,6 +464,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "net")]
     #[tokio::test]
     async fn download_checks_release_digest_and_size() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

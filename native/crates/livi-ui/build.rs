@@ -5,6 +5,16 @@
 use std::fmt::Write;
 
 fn main() {
+    livi_cfg::emit();
+    println!("cargo::rustc-check-cfg=cfg(winit)");
+    println!("cargo::rustc-check-cfg=cfg(kms)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if std::env::var_os("CARGO_CFG_LIVI_OS").is_some() {
+        println!("cargo::rustc-cfg=kms");
+    } else if os != "android" {
+        println!("cargo::rustc-cfg=winit");
+    }
+
     slint_build::compile("ui/app.slint").unwrap();
 
     let dir = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("ui/icons");
@@ -28,10 +38,4 @@ fn main() {
     table.push_str("];\n");
     let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("icons.rs");
     std::fs::write(out, table).unwrap();
-
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,/Library/Frameworks/GStreamer.framework/Versions/1.0/lib"
-        );
-    }
 }

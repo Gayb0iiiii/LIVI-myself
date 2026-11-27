@@ -5,10 +5,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use livi_host_proto::CameraOrder;
-use livi_host_proto::ctrl::{Command, Region};
-use livi_host_proto::display::Correction;
-use livi_host_proto::plane_place;
+use livi_output_proto::CameraOrder;
+use livi_output_proto::ctrl::{Command, Region};
+use livi_output_proto::display::Correction;
+use livi_output_proto::plane_place;
 use livi_video_player::{CameraPlayer, Player, Say, UrlPlayer};
 
 use crate::main_thread::on_main;
@@ -22,46 +22,50 @@ mod window {
     }
 
     pub fn backdrop(window: usize, [r, g, b]: [f64; 3]) {
+        // SAFETY: window is the UI window's NSView or 0, which is ignored.
         unsafe { livi_set_backdrop(window, r, g, b) };
     }
 
     pub fn prepare(window: usize) {
+        // SAFETY: window is the UI window's NSView or 0, which is ignored.
         unsafe { livi_prepare_window(window) };
     }
 
-    pub fn curves(window: usize, rgb: &[f32]) {
+    const CURVE_POINTS: usize = 256;
+
+    pub fn correct(window: usize, correction: super::Correction) {
+        let rgb: Vec<f32> = if correction.neutral() {
+            Vec::new()
+        } else {
+            let [r, g, b] = correction.curves(CURVE_POINTS);
+            (0..CURVE_POINTS)
+                .flat_map(|i| [r[i] as f32, g[i] as f32, b[i] as f32])
+                .collect()
+        };
         let count = i32::try_from(rgb.len() / 3).unwrap_or(0);
         let rgb = if count == 0 {
             std::ptr::null()
         } else {
             rgb.as_ptr()
         };
+        // SAFETY: rgb holds 3 * count floats or is null with count 0.
         unsafe { livi_set_window_curves(window, rgb, count) };
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(not(target_os = "macos"))]
 mod window {
     pub fn backdrop(_window: usize, _rgb: [f64; 3]) {}
 
     pub fn prepare(_window: usize) {}
 
-    pub fn curves(_window: usize, _rgb: &[f32]) {}
+    pub fn correct(window: usize, correction: super::Correction) {
+        livi_video_player::correct(window, correction);
+    }
 }
 
-const CURVE_POINTS: usize = 256;
-
 fn correct(window: usize, v: [f64; 5]) {
-    let correction = Correction::from_line(v);
-    if correction.neutral() {
-        window::curves(window, &[]);
-        return;
-    }
-    let [r, g, b] = correction.curves(CURVE_POINTS);
-    let rgb: Vec<f32> = (0..CURVE_POINTS)
-        .flat_map(|i| [r[i] as f32, g[i] as f32, b[i] as f32])
-        .collect();
-    window::curves(window, &rgb);
+    window::correct(window, Correction::from_line(v));
 }
 
 pub trait View: Send + Sync {
@@ -192,7 +196,10 @@ pub fn apply(cmd: Command) -> Option<String> {
         }),
         Command::Gamma(v) => on_main(|| {
             let mut s = screens();
-            s.gamma = Some(v);
+            // Every state change brings it again, the display only takes a new one.
+            if s.gamma.replace(v) == Some(v) {
+                return;
+            }
             s.windows.values().for_each(|&w| correct(w, v));
         }),
         _ => {}
@@ -202,10 +209,12 @@ pub fn apply(cmd: Command) -> Option<String> {
 
 pub fn create(
     id: u32,
-    codec: livi_host_proto::VideoCodec,
+    codec: livi_output_proto::VideoCodec,
     codec_data: &[u8],
 ) -> Option<Arc<Player>> {
-    draw(id, |window| Player::new(codec, window, codec_data))
+    let player = draw(id, |window| Player::new(codec, window, codec_data))?;
+    eprintln!("[video] plane 0x{id:x} plays as player {}", player.id());
+    Some(player)
 }
 
 pub fn play(id: u32, url: &str, audio_device: &str, say: Say) -> Option<Arc<UrlPlayer>> {
@@ -294,6 +303,9 @@ pub fn set_window(screen: &str, window: usize) {
         gone.iter().for_each(|v| v.stop());
         if window != 0 {
             window::prepare(window);
+            if screen == "main" {
+                livi_video_player::reserve_scanout(window);
+            }
         }
         if let (true, Some(rgb)) = (window != 0, backdrop) {
             paint(window, rgb);

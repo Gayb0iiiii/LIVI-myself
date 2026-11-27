@@ -4,14 +4,16 @@
 
 use super::*;
 
+const ZOOM_IN: u64 = 0;
+const ZOOM_OUT: u64 = 1;
+
 impl<M: Media> Conn<M> {
     pub(super) fn on_event_connection(&mut self, sock: TcpStream) {
         println!("[cpStack] event channel connected");
         let Some(shared) = self.pair_verify.shared_secret() else {
             return;
         };
-        let write = hkdf_sha512(&shared, b"Events-Salt", b"Events-Write-Encryption-Key");
-        let read = hkdf_sha512(&shared, b"Events-Salt", b"Events-Read-Encryption-Key");
+        let (read, write) = session_keys::events(&shared);
         let (rd, wr) = sock.into_split();
         self.event = Some(EventConn {
             read: rd,
@@ -29,15 +31,9 @@ impl<M: Media> Conn<M> {
             return;
         };
         ev.sealed.extend_from_slice(chunk);
-        match ev.cipher.decrypt(&ev.sealed) {
-            Ok((data, rest)) => {
-                ev.sealed = rest;
-                ev.plain.extend(data);
-            }
-            Err(_) => {
-                println!("[cpStack] event channel decrypt failed");
-                return;
-            }
+        if ev.cipher.open(&mut ev.sealed, &mut ev.plain).is_err() {
+            println!("[cpStack] event channel decrypt failed");
+            return;
         }
         let Ok((messages, rest)) = rtsp::parse(&ev.plain) else {
             println!("[cpStack] event message too large, event channel dropped");
@@ -174,6 +170,30 @@ impl<M: Media> Conn<M> {
         self.send_event_command(&dict([
             ("type", Value::String("forceKeyFrame".into())),
             ("params", dict([("uuid", Value::String(uuid.into()))])),
+        ]))
+        .await;
+    }
+
+    pub(super) async fn change_map_zoom(&mut self, zoom_in: bool) {
+        let direction = if zoom_in { "in" } else { "out" };
+        if !self.cluster_want || self.told(|info| info.cluster.is_none()) {
+            println!("[cpStack] changeMapZoomLevel {direction} skipped, no cluster stream shown");
+            return;
+        }
+        let uuid = self.alt_uuid();
+        println!("[cpStack] changeMapZoomLevel {direction} on {uuid}");
+        self.send_event_command(&dict([
+            ("type", Value::String("changeMapZoomLevel".into())),
+            (
+                "params",
+                dict([
+                    (
+                        "zoomDirection",
+                        Value::Int(if zoom_in { ZOOM_IN } else { ZOOM_OUT }),
+                    ),
+                    ("uuid", Value::String(uuid)),
+                ]),
+            ),
         ]))
         .await;
     }
